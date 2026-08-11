@@ -98,6 +98,7 @@ let input = "";
 let currentModel = null;
 let currentThinkingLevel = "medium";
 let promptCount = 0;
+let emitLateAbortEventsOnNextPrompt = false;
 const deferredResponses = [];
 const outputQueue = [];
 let outputActive = false;
@@ -161,6 +162,29 @@ function reject(command, error) {
     success: false,
     error,
   });
+}
+
+function writeLateAbortEvents() {
+  writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
+  writeJson({
+    type: "message_update",
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "late-aborted-content",
+    },
+  });
+  writeJson({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "late-aborted-content" }],
+    },
+  });
+  writeJson({ type: "agent_end", messages: [], willRetry: true });
+  writeJson({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 0 });
+  writeJson({ type: "auto_retry_end", success: true, attempt: 1 });
+  writeJson({ type: "agent_settled" });
 }
 
 function handleCommand(command) {
@@ -269,8 +293,15 @@ function handleCommand(command) {
             ? `selection:${currentModel?.provider ?? "none"}/${currentModel?.id ?? "none"}:${currentThinkingLevel}:${command.message ?? ""}`
             : `fake:${command.message ?? ""}`;
       respond(command);
+      if (emitLateAbortEventsOnNextPrompt) {
+        emitLateAbortEventsOnNextPrompt = false;
+        writeLateAbortEvents();
+      }
       writeJson({ type: "agent_start" });
-      if (process.env.PI_FAKE_WAIT_FOR_ABORT === "1") break;
+      const shouldWaitForAbort =
+        process.env.PI_FAKE_WAIT_FOR_ABORT === "1" ||
+        (process.env.PI_FAKE_WAIT_FOR_ABORT_ONCE === "1" && promptCount === 1);
+      if (shouldWaitForAbort) break;
       if (process.env.PI_FAKE_SCENARIO === "basic-turn") {
         writeJson({ type: "turn_start" });
         writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
@@ -387,13 +418,56 @@ function handleCommand(command) {
     case "get_entries":
       respond(command, { entries, leafId: entries.at(-1)?.id ?? null });
       break;
-    case "steer":
-      respond(command);
+    case "steer": {
+      if (process.env.PI_FAKE_REJECT_STEER === "1") {
+        reject(command, "rejected fake steer");
+        break;
+      }
+      const settleBeforeResponse = process.env.PI_FAKE_SETTLE_BEFORE_STEER_RESPONSE === "1";
+      if (!settleBeforeResponse) respond(command);
       writeJson({ type: "queue_update", steering: [command.message ?? ""] });
+      if (process.env.PI_FAKE_SETTLE_ON_STEER === "1" || settleBeforeResponse) {
+        writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
+        writeJson({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: `steered:${command.message ?? ""}`,
+          },
+        });
+        writeJson({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: `steered:${command.message ?? ""}` }],
+          },
+        });
+        writeJson({ type: "agent_settled" });
+      }
+      if (settleBeforeResponse) respond(command);
       break;
+    }
     case "abort":
-      respond(command);
+      if (process.env.PI_FAKE_HOLD_ABORT === "1") {
+        writeJson({ type: "test_abort_received" });
+      }
+      if (process.env.PI_FAKE_REJECT_ABORT === "1") {
+        reject(command, "rejected fake abort");
+        break;
+      }
+      if (process.env.PI_FAKE_EXIT_ON_ABORT === "1") {
+        process.exitCode = 29;
+        process.exit();
+        break;
+      }
+      if (process.env.PI_FAKE_HOLD_ABORT === "1") break;
       writeJson({ type: "agent_settled" });
+      respond(command);
+      if (process.env.PI_FAKE_ABORT_LATE_EVENTS === "1") writeLateAbortEvents();
+      if (process.env.PI_FAKE_ABORT_LATE_EVENTS_ON_NEXT_PROMPT === "1") {
+        emitLateAbortEventsOnNextPrompt = true;
+      }
       break;
     case "test_stderr":
       process.stderr.write(String(command.message ?? "fake diagnostic"));

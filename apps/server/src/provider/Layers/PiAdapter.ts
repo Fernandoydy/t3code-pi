@@ -19,9 +19,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -68,6 +68,7 @@ const PiAssistantDelta = Schema.Union([
   }),
 ]);
 const PiKnownEvent = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("agent_start") }),
   Schema.Struct({ type: Schema.Literal("agent_settled") }),
   Schema.Struct({
     type: Schema.Literal("message_start"),
@@ -107,6 +108,7 @@ const PiKnownEvent = Schema.Union([
     isError: Schema.Boolean,
   }),
 ]);
+type PiKnownEvent = typeof PiKnownEvent.Type;
 const decodePiKnownEvent = Schema.decodeUnknownOption(PiKnownEvent);
 const PiMessageContent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
@@ -146,16 +148,33 @@ export interface PiAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
 }
 
+interface PiBufferedEvent {
+  readonly event: PiKnownEvent;
+  readonly raw: PiRpcWireMessage;
+}
+
+interface PiActiveTurn {
+  readonly id: TurnId;
+  phase: "starting" | "running";
+  terminalState: "completed" | "failed" | "interrupted";
+  terminalError: string | undefined;
+  control:
+    | { readonly _tag: "Active" }
+    | {
+        readonly _tag: "Aborting";
+        bufferedEvents: Array<PiBufferedEvent>;
+      };
+}
+
 interface PiSessionContext {
   session: ProviderSession;
   readonly rpc: Effect.Success<ReturnType<typeof makePiRpcProcess>>;
   readonly scope: Scope.Closeable;
-  activeTurnId: TurnId | undefined;
+  readonly lifecycleMutex: Semaphore.Semaphore;
+  activeTurn: PiActiveTurn | undefined;
   activeAssistantItemId: string | undefined;
   assistantMessageSequence: number;
-  terminalState: "completed" | "failed" | "interrupted";
-  terminalError: string | undefined;
-  readonly stopped: Ref.Ref<boolean>;
+  stopped: boolean;
 }
 
 function piToolItemType(toolName: string) {
@@ -333,7 +352,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
   const requireSession = Effect.fn("PiAdapter.requireSession")(function* (threadId: ThreadId) {
     const context = sessions.get(threadId);
-    if (!context || (yield* Ref.get(context.stopped))) {
+    if (!context || context.stopped) {
       return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId });
     }
     return context;
@@ -432,13 +451,73 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context.session = next;
   });
 
-  const claimContextStop = Effect.fn("PiAdapter.claimContextStop")(function* (
+  const refreshNativeCursor = Effect.fn("PiAdapter.refreshNativeCursor")(function* (
     context: PiSessionContext,
   ) {
-    if (yield* Ref.getAndSet(context.stopped, true)) return false;
-    if (sessions.get(context.session.threadId) === context) {
-      sessions.delete(context.session.threadId);
+    const previousCursor = yield* decodeResumeCursor(context.session.resumeCursor);
+    const refreshedCursor = yield* readNativeCursor(context.rpc, "get_state").pipe(
+      Effect.flatMap((currentCursor) =>
+        verifyNativeCursor(previousCursor, currentCursor, "session/state"),
+      ),
+    );
+    yield* updateSession(context, { resumeCursor: refreshedCursor });
+    return refreshedCursor;
+  });
+
+  const ensureCurrentContext = Effect.fn("PiAdapter.ensureCurrentContext")(function* (
+    context: PiSessionContext,
+  ) {
+    if (context.stopped || sessions.get(context.session.threadId) !== context) {
+      return yield* new ProviderAdapterSessionNotFoundError({
+        provider: PROVIDER,
+        threadId: context.session.threadId,
+      });
     }
+  });
+
+  const finalizeTurn = Effect.fn("PiAdapter.finalizeTurn")(function* (
+    context: PiSessionContext,
+    turn: PiActiveTurn,
+    input?: {
+      readonly state?: "completed" | "failed" | "interrupted";
+      readonly errorMessage?: string;
+      readonly reason?: string;
+      readonly raw?: PiRpcWireMessage;
+    },
+  ) {
+    if (context.activeTurn !== turn) return false;
+
+    const state = input?.state ?? turn.terminalState;
+    const errorMessage = input?.errorMessage ?? turn.terminalError;
+    context.activeTurn = undefined;
+    context.activeAssistantItemId = undefined;
+    yield* updateSession(context, { status: "ready" }, true);
+
+    if (state === "interrupted") {
+      yield* publish({
+        ...(yield* makeEventBase({
+          threadId: context.session.threadId,
+          turnId: turn.id,
+          ...(input?.raw ? { raw: input.raw } : {}),
+        })),
+        type: "turn.aborted",
+        payload: { reason: input?.reason ?? "Pi Agent turn was interrupted." },
+      });
+      return true;
+    }
+
+    yield* publish({
+      ...(yield* makeEventBase({
+        threadId: context.session.threadId,
+        turnId: turn.id,
+        ...(input?.raw ? { raw: input.raw } : {}),
+      })),
+      type: "turn.completed",
+      payload:
+        state === "failed"
+          ? { state: "failed", errorMessage: errorMessage ?? "Pi Agent turn failed." }
+          : { state: "completed" },
+    });
     return true;
   });
 
@@ -446,7 +525,23 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context: PiSessionContext,
     emitExit = true,
   ) {
-    if (!(yield* claimContextStop(context))) return;
+    const claimed = yield* context.lifecycleMutex.withPermit(
+      Effect.gen(function* () {
+        if (context.stopped) return false;
+        const turn = context.activeTurn;
+        if (turn) {
+          yield* finalizeTurn(context, turn, {
+            state: "interrupted",
+            reason: "Pi Agent session stopped while the turn was active.",
+          });
+        }
+        context.stopped = true;
+        sessions.delete(context.session.threadId);
+        return true;
+      }),
+    );
+    if (!claimed) return;
+
     yield* Scope.close(context.scope, Exit.void).pipe(Effect.ignore);
     if (emitExit) {
       yield* publish({
@@ -461,20 +556,25 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context: PiSessionContext,
     cause: unknown,
   ) {
-    if (!(yield* claimContextStop(context))) return;
-    const turnId = context.activeTurnId;
     const message = cause instanceof Error ? cause.message : "Pi Agent RPC process failed.";
-    if (turnId) {
-      yield* publish({
-        ...(yield* makeEventBase({ threadId: context.session.threadId, turnId })),
-        type: "turn.completed",
-        payload: { state: "failed", errorMessage: message },
-      });
-    }
+    const claimed = yield* context.lifecycleMutex.withPermit(
+      Effect.gen(function* () {
+        if (context.stopped) return { claimed: false as const };
+        const turn = context.activeTurn;
+        if (turn) {
+          yield* finalizeTurn(context, turn, { state: "failed", errorMessage: message });
+        }
+        context.stopped = true;
+        sessions.delete(context.session.threadId);
+        return { claimed: true as const, turnId: turn?.id };
+      }),
+    );
+    if (!claimed.claimed) return;
+
     yield* publish({
       ...(yield* makeEventBase({
         threadId: context.session.threadId,
-        ...(turnId ? { turnId } : {}),
+        ...(claimed.turnId ? { turnId: claimed.turnId } : {}),
       })),
       type: "runtime.error",
       payload: { message, class: "transport_error", detail: cause },
@@ -482,7 +582,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     yield* publish({
       ...(yield* makeEventBase({
         threadId: context.session.threadId,
-        ...(turnId ? { turnId } : {}),
+        ...(claimed.turnId ? { turnId: claimed.turnId } : {}),
       })),
       type: "session.exited",
       payload: { reason: message, recoverable: false, exitKind: "error" },
@@ -497,23 +597,36 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     return itemId;
   };
 
-  const handleEvent = Effect.fn("PiAdapter.handleEvent")(function* (
+  const processKnownEvent = Effect.fn("PiAdapter.processKnownEvent")(function* (
     context: PiSessionContext,
+    event: PiKnownEvent,
     rawEvent: PiRpcWireMessage,
   ) {
-    yield* logNative(context.session.threadId, rawEvent);
-    const event = Option.getOrUndefined(decodePiKnownEvent(rawEvent));
-    if (!event) return;
-    const turnId = context.activeTurnId;
+    if (context.stopped) return;
+    const turn = context.activeTurn;
+    if (!turn) return;
 
+    if (turn.control._tag === "Aborting") {
+      turn.control.bufferedEvents.push({ event, raw: rawEvent });
+      return;
+    }
+
+    // Pi events do not carry a T3 turn ID. Until the next native agent_start,
+    // events still queued from a settled or interrupted turn stay fenced out.
+    if (event.type === "agent_start") {
+      if (turn.phase === "starting") turn.phase = "running";
+      return;
+    }
+    if (turn.phase === "starting") return;
+
+    const turnId = turn.id;
     switch (event.type) {
       case "message_start": {
-        if (!turnId || event.message.role !== "assistant") return;
+        if (event.message.role !== "assistant") return;
         beginAssistantMessage(context, turnId);
         return;
       }
       case "message_update": {
-        if (!turnId) return;
         const delta = event.assistantMessageEvent;
         const itemId = context.activeAssistantItemId ?? beginAssistantMessage(context, turnId);
         yield* publish({
@@ -532,14 +645,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return;
       }
       case "message_end": {
-        if (!turnId || event.message.role !== "assistant") return;
+        if (event.message.role !== "assistant") return;
         const itemId = context.activeAssistantItemId ?? beginAssistantMessage(context, turnId);
         const detail = finalAssistantText(event.message.content);
         if (event.message.stopReason === "error") {
-          context.terminalState = "failed";
-          context.terminalError = event.message.errorMessage ?? "Pi Agent turn failed.";
+          turn.terminalState = "failed";
+          turn.terminalError = event.message.errorMessage ?? "Pi Agent turn failed.";
         } else if (event.message.stopReason === "aborted") {
-          context.terminalState = "interrupted";
+          turn.terminalState = "interrupted";
         }
         yield* publish({
           ...(yield* makeEventBase({
@@ -560,7 +673,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return;
       }
       case "tool_execution_start": {
-        if (!turnId) return;
         yield* publish({
           ...(yield* makeEventBase({
             threadId: context.session.threadId,
@@ -579,7 +691,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return;
       }
       case "tool_execution_update": {
-        if (!turnId) return;
         yield* publish({
           ...(yield* makeEventBase({
             threadId: context.session.threadId,
@@ -598,7 +709,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return;
       }
       case "tool_execution_end": {
-        if (!turnId) return;
         yield* publish({
           ...(yield* makeEventBase({
             threadId: context.session.threadId,
@@ -617,40 +727,20 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return;
       }
       case "agent_settled": {
-        if (!turnId) return;
-        context.activeTurnId = undefined;
-        context.activeAssistantItemId = undefined;
-        yield* updateSession(context, { status: "ready" }, true);
-        if (context.terminalState === "interrupted") {
-          yield* publish({
-            ...(yield* makeEventBase({
-              threadId: context.session.threadId,
-              turnId,
-              raw: rawEvent,
-            })),
-            type: "turn.aborted",
-            payload: { reason: "Pi Agent turn was interrupted." },
-          });
-          return;
-        }
-        yield* publish({
-          ...(yield* makeEventBase({
-            threadId: context.session.threadId,
-            turnId,
-            raw: rawEvent,
-          })),
-          type: "turn.completed",
-          payload:
-            context.terminalState === "failed"
-              ? {
-                  state: "failed",
-                  errorMessage: context.terminalError ?? "Pi Agent turn failed.",
-                }
-              : { state: "completed" },
-        });
+        yield* finalizeTurn(context, turn, { raw: rawEvent });
         return;
       }
     }
+  });
+
+  const handleEvent = Effect.fn("PiAdapter.handleEvent")(function* (
+    context: PiSessionContext,
+    rawEvent: PiRpcWireMessage,
+  ) {
+    yield* logNative(context.session.threadId, rawEvent);
+    const event = Option.getOrUndefined(decodePiKnownEvent(rawEvent));
+    if (!event) return;
+    yield* context.lifecycleMutex.withPermit(processKnownEvent(context, event, rawEvent));
   });
 
   const startEventPump = Effect.fn("PiAdapter.startEventPump")(function* (
@@ -804,12 +894,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         session,
         rpc,
         scope: sessionScope,
-        activeTurnId: undefined,
+        lifecycleMutex: yield* Semaphore.make(1),
+        activeTurn: undefined,
         activeAssistantItemId: undefined,
         assistantMessageSequence: 0,
-        terminalState: "completed",
-        terminalError: undefined,
-        stopped: yield* Ref.make(false),
+        stopped: false,
       };
       sessions.set(input.threadId, context);
       yield* startEventPump(context);
@@ -829,14 +918,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
   const sendTurn: PiAdapterShape["sendTurn"] = Effect.fn("PiAdapter.sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
-    if (context.activeTurnId) {
-      return yield* new ProviderAdapterValidationError({
-        provider: PROVIDER,
-        operation: "sendTurn",
-        issue: "Pi Agent is already running a turn for this thread.",
-      });
-    }
-    if (!input.input?.trim()) {
+    const message = input.input?.trim();
+    if (!message) {
       return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
         operation: "sendTurn",
@@ -859,67 +942,95 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       yield* updateSession(context, { model });
     }
 
-    const turnId = TurnId.make(`pi-turn-${yield* randomId}`);
-    context.activeTurnId = turnId;
-    context.activeAssistantItemId = undefined;
-    context.assistantMessageSequence = 0;
-    context.terminalState = "completed";
-    context.terminalError = undefined;
-    yield* updateSession(context, { status: "running", activeTurnId: turnId });
-    yield* publish({
-      ...(yield* makeEventBase({ threadId: input.threadId, turnId })),
-      type: "turn.started",
-      payload: context.session.model ? { model: context.session.model } : {},
-    });
-    const promptExit = yield* context.rpc
-      .request({ type: "prompt", message: input.input.trim() })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProviderAdapterRequestError({
+    return yield* context.lifecycleMutex.withPermit(
+      Effect.gen(function* () {
+        yield* ensureCurrentContext(context);
+        const activeTurn = context.activeTurn;
+        if (activeTurn) {
+          if (activeTurn.control._tag === "Aborting") {
+            return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
-              method: "prompt",
-              detail: cause.message,
-              cause,
-            }),
-        ),
-        Effect.exit,
-      );
-    if (Exit.isFailure(promptExit)) {
-      context.activeTurnId = undefined;
-      context.activeAssistantItemId = undefined;
-      yield* updateSession(context, { status: "ready" }, true);
-      const cause = promptExit.cause;
-      yield* publish({
-        ...(yield* makeEventBase({
-          threadId: input.threadId,
-          turnId,
-          raw: { type: "prompt_rejected" },
-        })),
-        type: "turn.completed",
-        payload: {
-          state: "failed",
-          errorMessage: "Pi Agent rejected the prompt before starting work.",
-        },
-      });
-      return yield* Effect.failCause(cause);
-    }
-    const previousCursor = yield* decodeResumeCursor(context.session.resumeCursor);
-    const refreshedCursor = yield* readNativeCursor(context.rpc, "get_state").pipe(
-      Effect.flatMap((currentCursor) =>
-        verifyNativeCursor(previousCursor, currentCursor, "session/state"),
-      ),
+              operation: "sendTurn",
+              issue: "Pi Agent is interrupting the active turn for this thread.",
+            });
+          }
+          yield* context.rpc.request({ type: "steer", message }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "steer",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+          );
+          const resumeCursor = yield* refreshNativeCursor(context);
+          return { threadId: input.threadId, turnId: activeTurn.id, resumeCursor };
+        }
+
+        const turnId = TurnId.make(`pi-turn-${yield* randomId}`);
+        const turn: PiActiveTurn = {
+          id: turnId,
+          phase: "starting",
+          terminalState: "completed",
+          terminalError: undefined,
+          control: { _tag: "Active" },
+        };
+        context.activeTurn = turn;
+        context.activeAssistantItemId = undefined;
+        context.assistantMessageSequence = 0;
+        yield* updateSession(context, { status: "running", activeTurnId: turnId });
+        yield* publish({
+          ...(yield* makeEventBase({ threadId: input.threadId, turnId })),
+          type: "turn.started",
+          payload: context.session.model ? { model: context.session.model } : {},
+        });
+
+        const promptExit = yield* context.rpc.request({ type: "prompt", message }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "prompt",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+          Effect.exit,
+        );
+        if (Exit.isFailure(promptExit)) {
+          yield* finalizeTurn(context, turn, {
+            state: "failed",
+            errorMessage: "Pi Agent rejected the prompt before starting work.",
+            raw: { type: "prompt_rejected" },
+          });
+          return yield* Effect.failCause(promptExit.cause);
+        }
+        const resumeCursor = yield* refreshNativeCursor(context);
+        return { threadId: input.threadId, turnId, resumeCursor };
+      }),
     );
-    yield* updateSession(context, { resumeCursor: refreshedCursor });
-    return { threadId: input.threadId, turnId, resumeCursor: refreshedCursor };
   });
 
   const interruptTurn: PiAdapterShape["interruptTurn"] = Effect.fn("PiAdapter.interruptTurn")(
     function* (threadId) {
       const context = yield* requireSession(threadId);
-      if (!context.activeTurnId) return;
-      context.terminalState = "interrupted";
-      yield* context.rpc.request({ type: "abort" }).pipe(
+      const turn = yield* context.lifecycleMutex.withPermit(
+        Effect.gen(function* () {
+          yield* ensureCurrentContext(context);
+          const activeTurn = context.activeTurn;
+          if (!activeTurn || activeTurn.control._tag === "Aborting") return undefined;
+          activeTurn.control = {
+            _tag: "Aborting",
+            bufferedEvents: [],
+          };
+          return activeTurn;
+        }),
+      );
+      if (!turn) return;
+
+      const abortExit = yield* context.rpc.request({ type: "abort" }).pipe(
         Effect.mapError(
           (cause) =>
             new ProviderAdapterRequestError({
@@ -929,7 +1040,33 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               cause,
             }),
         ),
+        Effect.exit,
       );
+
+      if (Exit.isSuccess(abortExit)) {
+        yield* context.lifecycleMutex.withPermit(
+          Effect.gen(function* () {
+            yield* ensureCurrentContext(context);
+            if (context.activeTurn !== turn || turn.control._tag !== "Aborting") return;
+            yield* finalizeTurn(context, turn, { state: "interrupted" });
+          }),
+        );
+        return;
+      }
+
+      yield* context.lifecycleMutex.withPermit(
+        Effect.gen(function* () {
+          if (context.stopped || context.activeTurn !== turn || turn.control._tag !== "Aborting") {
+            return;
+          }
+          const bufferedEvents = turn.control.bufferedEvents;
+          turn.control = { _tag: "Active" };
+          for (const buffered of bufferedEvents) {
+            yield* processKnownEvent(context, buffered.event, buffered.raw);
+          }
+        }),
+      );
+      return yield* Effect.failCause(abortExit.cause);
     },
   );
 
@@ -1022,11 +1159,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     },
   );
 
-  const hasSession: PiAdapterShape["hasSession"] = Effect.fn("PiAdapter.hasSession")(
-    function* (threadId) {
+  const hasSession: PiAdapterShape["hasSession"] = Effect.fn("PiAdapter.hasSession")((threadId) =>
+    Effect.sync(() => {
       const context = sessions.get(threadId);
-      return context !== undefined && !(yield* Ref.get(context.stopped));
-    },
+      return context !== undefined && !context.stopped;
+    }),
   );
 
   const stopAll: PiAdapterShape["stopAll"] = Effect.fn("PiAdapter.stopAll")(function* () {

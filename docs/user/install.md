@@ -65,7 +65,9 @@ Pi Agent requires version 0.84.1 or newer. T3 Code uses Pi's existing models, cr
 settings, project-trust decisions, and native session storage; configure those in Pi itself. The
 model picker shows Pi's native provider/model identities and supported thinking levels, and can
 switch models within an existing thread. Pi-backed threads resume their exact native conversation
-after a server restart or idle cleanup. Pi does not expose T3 Code's permission or plan-mode
+after a server restart or idle cleanup. Sending another message while a Pi turn is active steers
+that turn, and stopping it interrupts the native Pi turn without ending the session. Pi does not
+expose T3 Code's permission or plan-mode
 controls.
 
 ### Binary Discovery
