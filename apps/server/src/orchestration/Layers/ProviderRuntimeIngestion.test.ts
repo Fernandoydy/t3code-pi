@@ -916,6 +916,58 @@ describe("ProviderRuntimeIngestion", () => {
     await waitForThread(harness.readModel, (thread) => thread.session?.status === "ready");
   });
 
+  it("clears only the matching active turn when the provider aborts", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const activeTurnId = asTurnId("turn-aborted-active");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-abort"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: activeTurnId,
+    });
+    await harness.drain();
+    const runningReadModel = await harness.readModel();
+    const runningThread = runningReadModel.threads.find(
+      (entry) => entry.id === asThreadId("thread-1"),
+    );
+    expect(runningThread?.session?.status).toBe("running");
+    expect(runningThread?.session?.activeTurnId).toBe(activeTurnId);
+
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted-stale"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-aborted-stale"),
+      payload: { reason: "stale abort" },
+    });
+    await harness.drain();
+    const midReadModel = await harness.readModel();
+    const midThread = midReadModel.threads.find((entry) => entry.id === asThreadId("thread-1"));
+    expect(midThread?.session?.status).toBe("running");
+    expect(midThread?.session?.activeTurnId).toBe(activeTurnId);
+
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted-active"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: activeTurnId,
+      payload: { reason: "user interrupted" },
+    });
+    await harness.drain();
+    const finalReadModel = await harness.readModel();
+    const finalThread = finalReadModel.threads.find((entry) => entry.id === asThreadId("thread-1"));
+    expect(finalThread?.session?.status).toBe("ready");
+    expect(finalThread?.session?.activeTurnId).toBeNull();
+  });
+
   it("ignores non-active turn completion when runtime omits thread id", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

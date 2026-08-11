@@ -10,9 +10,13 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
@@ -32,6 +36,14 @@ import * as ProviderService from "../Services/ProviderService.ts";
 import { makeFakePiExecutable } from "../testUtils/piFakeExecutable.ts";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
+const PiNativeLogEntry = Schema.Struct({
+  event: Schema.Struct({
+    payload: Schema.StructWithRest(Schema.Struct({ type: Schema.String }), [
+      Schema.Record(Schema.String, Schema.Unknown),
+    ]),
+  }),
+});
+const decodePiNativeLogEntry = Schema.decodeUnknownOption(PiNativeLogEntry);
 
 const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
   reportClientActivity: () => Effect.void,
@@ -62,7 +74,10 @@ const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPol
   shouldRunOpportunisticWork: Effect.succeed(true),
 });
 
-function makeTestLayer(executable: string) {
+function makeTestLayer(
+  executable: string,
+  eventLoggers: ProviderEventLoggers["Service"] = NoOpProviderEventLoggers,
+) {
   const instanceId = ProviderInstanceId.make("pi_work");
   const configMap: ProviderInstanceConfigMap = {
     [instanceId]: {
@@ -112,11 +127,56 @@ function makeTestLayer(executable: string) {
       ],
       config: { binaryPath: executable },
     },
+    [ProviderInstanceId.make("pi_steer")]: {
+      driver: ProviderDriverKind.make("piAgent"),
+      displayName: "Pi Steer",
+      enabled: true,
+      environment: [
+        { name: "PI_FAKE_WAIT_FOR_ABORT", value: "1", sensitive: false },
+        { name: "PI_FAKE_SETTLE_BEFORE_STEER_RESPONSE", value: "1", sensitive: false },
+      ],
+      config: { binaryPath: executable },
+    },
     [ProviderInstanceId.make("pi_abort")]: {
       driver: ProviderDriverKind.make("piAgent"),
       displayName: "Pi Abort",
       enabled: true,
-      environment: [{ name: "PI_FAKE_WAIT_FOR_ABORT", value: "1", sensitive: false }],
+      environment: [
+        { name: "PI_FAKE_SCENARIO", value: "basic-turn", sensitive: false },
+        { name: "PI_FAKE_WAIT_FOR_ABORT_ONCE", value: "1", sensitive: false },
+        { name: "PI_FAKE_ABORT_LATE_EVENTS_ON_NEXT_PROMPT", value: "1", sensitive: false },
+      ],
+      config: { binaryPath: executable },
+    },
+    [ProviderInstanceId.make("pi_abort_reject")]: {
+      driver: ProviderDriverKind.make("piAgent"),
+      displayName: "Pi Abort Reject",
+      enabled: true,
+      environment: [
+        { name: "PI_FAKE_WAIT_FOR_ABORT", value: "1", sensitive: false },
+        { name: "PI_FAKE_REJECT_ABORT", value: "1", sensitive: false },
+        { name: "PI_FAKE_SETTLE_ON_STEER", value: "1", sensitive: false },
+      ],
+      config: { binaryPath: executable },
+    },
+    [ProviderInstanceId.make("pi_abort_exit")]: {
+      driver: ProviderDriverKind.make("piAgent"),
+      displayName: "Pi Abort Exit",
+      enabled: true,
+      environment: [
+        { name: "PI_FAKE_WAIT_FOR_ABORT", value: "1", sensitive: false },
+        { name: "PI_FAKE_EXIT_ON_ABORT", value: "1", sensitive: false },
+      ],
+      config: { binaryPath: executable },
+    },
+    [ProviderInstanceId.make("pi_abort_stop")]: {
+      driver: ProviderDriverKind.make("piAgent"),
+      displayName: "Pi Abort Stop",
+      enabled: true,
+      environment: [
+        { name: "PI_FAKE_WAIT_FOR_ABORT", value: "1", sensitive: false },
+        { name: "PI_FAKE_HOLD_ABORT", value: "1", sensitive: false },
+      ],
       config: { binaryPath: executable },
     },
   };
@@ -129,7 +189,7 @@ function makeTestLayer(executable: string) {
     Layer.provideMerge(NodeServices.layer),
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(settingsLayer),
-    Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
+    Layer.provideMerge(Layer.succeed(ProviderEventLoggers, eventLoggers)),
   );
   const instanceRegistry = ProviderInstanceRegistryLayer({
     drivers: [PiDriver],
@@ -147,7 +207,7 @@ function makeTestLayer(executable: string) {
     Layer.provide(settingsLayer),
     Layer.provide(infrastructure),
     Layer.provide(AnalyticsService.AnalyticsService.layerTest),
-    Layer.provide(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
+    Layer.provide(Layer.succeed(ProviderEventLoggers, eventLoggers)),
   );
 }
 
@@ -486,13 +546,19 @@ describe("Pi provider through ProviderService", () => {
     );
   });
 
-  it.effect("reports interrupted Pi turns as aborted", () => {
+  it.effect("keeps one turn when Pi settles before the steer response", () => {
     const fake = makeFakePiExecutable("t3-pi-service-");
-    const instanceId = ProviderInstanceId.make("pi_abort");
-    const threadId = ThreadId.make("thread-pi-abort");
+    const instanceId = ProviderInstanceId.make("pi_steer");
+    const threadId = ThreadId.make("thread-pi-steer");
 
     return Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
+      const eventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
       yield* provider.startSession(threadId, {
         threadId,
         provider: ProviderDriverKind.make("piAgent"),
@@ -501,21 +567,229 @@ describe("Pi provider through ProviderService", () => {
         runtimeMode: "full-access",
         modelSelection: { instanceId, model: "fake/fake-model" },
       });
+
+      const first = yield* provider.sendTurn({ threadId, input: "start" });
+      const steered = yield* provider.sendTurn({ threadId, input: "redirect" });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+
+      expect(steered.turnId).toBe(first.turnId);
+      expect(events.filter((event) => event.type === "turn.started")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "content.delta",
+          turnId: first.turnId,
+          payload: { streamKind: "assistant_text", delta: "steered:redirect" },
+        }),
+      );
+    }).pipe(
+      Effect.provide(makeTestLayer(fake.executable)),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("fences delayed abort events when reusing the Pi session", () => {
+    const fake = makeFakePiExecutable("t3-pi-service-");
+    const instanceId = ProviderInstanceId.make("pi_abort");
+    const threadId = ThreadId.make("thread-pi-abort");
+
+    return Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
       const eventsFiber = yield* provider.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId),
-        Stream.takeUntil((event) => event.type === "turn.aborted"),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
         Stream.runCollect,
         Effect.forkChild({ startImmediately: true }),
       );
+      yield* provider.startSession(threadId, {
+        threadId,
+        provider: ProviderDriverKind.make("piAgent"),
+        providerInstanceId: instanceId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId, model: "fake/fake-model" },
+      });
 
-      yield* provider.sendTurn({ threadId, input: "wait" });
+      const interrupted = yield* provider.sendTurn({ threadId, input: "wait" });
       yield* provider.interruptTurn({ threadId });
+      const resumed = yield* provider.sendTurn({ threadId, input: "continue" });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const interruptedTerminals = events.filter(
+        (event) =>
+          event.turnId === interrupted.turnId &&
+          (event.type === "turn.aborted" || event.type === "turn.completed"),
+      );
 
-      expect(Array.from(yield* Fiber.join(eventsFiber)).at(-1)).toMatchObject({
-        type: "turn.aborted",
+      expect(resumed.turnId).not.toBe(interrupted.turnId);
+      expect(interruptedTerminals).toHaveLength(1);
+      expect(interruptedTerminals[0]?.type).toBe("turn.aborted");
+      expect(
+        events.some(
+          (event) =>
+            event.type === "content.delta" && event.payload.delta === "late-aborted-content",
+        ),
+      ).toBe(false);
+      expect(events.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: resumed.turnId,
+        payload: { state: "completed" },
       });
     }).pipe(
       Effect.provide(makeTestLayer(fake.executable)),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("keeps the active Pi turn running when native abort is rejected", () => {
+    const fake = makeFakePiExecutable("t3-pi-service-");
+    const instanceId = ProviderInstanceId.make("pi_abort_reject");
+    const threadId = ThreadId.make("thread-pi-abort-reject");
+
+    return Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const eventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.startSession(threadId, {
+        threadId,
+        provider: ProviderDriverKind.make("piAgent"),
+        providerInstanceId: instanceId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId, model: "fake/fake-model" },
+      });
+
+      const turn = yield* provider.sendTurn({ threadId, input: "wait" });
+      const interruptError = yield* provider.interruptTurn({ threadId }).pipe(Effect.flip);
+      const steered = yield* provider.sendTurn({ threadId, input: "keep going" });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+
+      expect(interruptError).toMatchObject({
+        _tag: "ProviderAdapterRequestError",
+        method: "abort",
+      });
+      expect(steered.turnId).toBe(turn.turnId);
+      expect(events.filter((event) => event.type === "turn.aborted")).toHaveLength(0);
+      expect(events.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: turn.turnId,
+        payload: { state: "completed" },
+      });
+    }).pipe(
+      Effect.provide(makeTestLayer(fake.executable)),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("fails deterministically when the Pi process exits during interruption", () => {
+    const fake = makeFakePiExecutable("t3-pi-service-");
+    const instanceId = ProviderInstanceId.make("pi_abort_exit");
+    const threadId = ThreadId.make("thread-pi-abort-exit");
+
+    return Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const eventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "session.exited"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.startSession(threadId, {
+        threadId,
+        provider: ProviderDriverKind.make("piAgent"),
+        providerInstanceId: instanceId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId, model: "fake/fake-model" },
+      });
+
+      const turn = yield* provider.sendTurn({ threadId, input: "wait" });
+      const interruptError = yield* provider.interruptTurn({ threadId }).pipe(Effect.flip);
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const terminals = events.filter(
+        (event) =>
+          event.turnId === turn.turnId &&
+          (event.type === "turn.aborted" || event.type === "turn.completed"),
+      );
+
+      expect(interruptError).toMatchObject({
+        _tag: "ProviderAdapterRequestError",
+        method: "abort",
+      });
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]).toMatchObject({
+        type: "turn.completed",
+        payload: { state: "failed" },
+      });
+      expect(events.at(-1)).toMatchObject({
+        type: "session.exited",
+        payload: { exitKind: "error" },
+      });
+    }).pipe(
+      Effect.provide(makeTestLayer(fake.executable)),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("lets session stop win a pending Pi abort without duplicate terminals", () => {
+    const fake = makeFakePiExecutable("t3-pi-service-");
+    const instanceId = ProviderInstanceId.make("pi_abort_stop");
+    const threadId = ThreadId.make("thread-pi-abort-stop");
+    const abortReceived = Deferred.makeUnsafe<void>();
+    const eventLoggers = ProviderEventLoggers.of({
+      native: {
+        filePath: "memory://pi-native-events",
+        write: (entry) => {
+          const decoded = Option.getOrUndefined(decodePiNativeLogEntry(entry));
+          return decoded?.event.payload.type === "test_abort_received"
+            ? Deferred.succeed(abortReceived, undefined).pipe(Effect.asVoid)
+            : Effect.void;
+        },
+        close: () => Effect.void,
+      },
+      canonical: undefined,
+    });
+
+    return Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const eventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "session.exited"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.startSession(threadId, {
+        threadId,
+        provider: ProviderDriverKind.make("piAgent"),
+        providerInstanceId: instanceId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId, model: "fake/fake-model" },
+      });
+      const turn = yield* provider.sendTurn({ threadId, input: "wait" });
+      const interruptFiber = yield* provider
+        .interruptTurn({ threadId })
+        .pipe(Effect.exit, Effect.forkChild({ startImmediately: true }));
+
+      yield* Deferred.await(abortReceived);
+      yield* provider.stopSession({ threadId });
+      const interruptExit = yield* Fiber.join(interruptFiber);
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const terminals = events.filter(
+        (event) =>
+          event.turnId === turn.turnId &&
+          (event.type === "turn.aborted" || event.type === "turn.completed"),
+      );
+
+      expect(Exit.isFailure(interruptExit)).toBe(true);
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]?.type).toBe("turn.aborted");
+      expect(events.at(-1)?.type).toBe("session.exited");
+    }).pipe(
+      Effect.provide(makeTestLayer(fake.executable, eventLoggers)),
       Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
     );
   });
