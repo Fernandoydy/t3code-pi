@@ -62,8 +62,9 @@ Run the login command on the machine running the T3 Code server, not on the devi
 from.
 
 Pi Agent requires version 0.84.1 or newer. T3 Code uses Pi's existing models, credentials,
-settings, and project-trust decisions; configure those in Pi itself. Pi does not expose T3 Code's
-permission or plan-mode controls.
+settings, project-trust decisions, and native session storage; configure those in Pi itself.
+Pi-backed threads resume their exact native conversation after a server restart or idle cleanup.
+Pi does not expose T3 Code's permission or plan-mode controls.
 
 ### Binary Discovery
 

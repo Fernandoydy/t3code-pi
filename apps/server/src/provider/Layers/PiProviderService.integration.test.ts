@@ -179,8 +179,12 @@ describe("Pi provider through ProviderService", () => {
         cwd: process.cwd(),
         model: "fake/fake-model",
       });
-      expect(session.resumeCursor).toBeUndefined();
-      expect(turn.resumeCursor).toBeUndefined();
+      expect(session.resumeCursor).toEqual({
+        schemaVersion: 1,
+        sessionFile: expect.stringMatching(/\.jsonl$/),
+        sessionId: expect.stringMatching(/^fake-session-/),
+      });
+      expect(turn.resumeCursor).toEqual(session.resumeCursor);
       expect(events.map((event) => event.type)).toEqual([
         "session.started",
         "thread.started",
@@ -236,6 +240,65 @@ describe("Pi provider through ProviderService", () => {
       Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
     );
   });
+
+  it.effect(
+    "recovers the persisted exact native session after its owned process is stopped",
+    () => {
+      const fake = makeFakePiExecutable("t3-pi-service-");
+      const instanceId = ProviderInstanceId.make("pi_work");
+      const threadId = ThreadId.make("thread-pi-persisted-resume");
+
+      return Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const session = yield* provider.startSession(threadId, {
+          threadId,
+          provider: ProviderDriverKind.make("piAgent"),
+          providerInstanceId: instanceId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          modelSelection: { instanceId, model: "fake/fake-model" },
+        });
+
+        const firstEventsFiber = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* provider.sendTurn({ threadId, input: "before stop" });
+        yield* Fiber.join(firstEventsFiber);
+        yield* provider.stopSession({ threadId });
+
+        const resumedEventsFiber = yield* provider.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const resumedTurn = yield* provider.sendTurn({ threadId, input: "after stop" });
+        const resumedEvents = Array.from(yield* Fiber.join(resumedEventsFiber));
+
+        expect(resumedTurn.resumeCursor).toEqual(session.resumeCursor);
+        expect(
+          resumedEvents.find(
+            (event) =>
+              event.type === "content.delta" && event.payload.streamKind === "assistant_text",
+          ),
+        ).toMatchObject({
+          payload: {
+            delta: expect.stringContaining(":--mode,rpc,--session,"),
+          },
+        });
+        expect(resumedEvents.at(-1)).toMatchObject({
+          type: "turn.completed",
+          payload: { state: "completed" },
+        });
+      }).pipe(
+        Effect.provide(makeTestLayer(fake.executable)),
+        Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      );
+    },
+  );
 
   it.effect("recovers after Pi rejects a prompt before accepting it", () => {
     const fake = makeFakePiExecutable("t3-pi-service-");

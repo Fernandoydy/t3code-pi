@@ -25,7 +25,7 @@ const fakePiPath = NodePath.join(__dirname, "../testFixtures/piRpcFake.mjs");
 const makeFakePi = Effect.fn("test.makeFakePi")(function* () {
   return yield* makePiRpcProcess({
     command: process.execPath,
-    args: [fakePiPath],
+    args: [fakePiPath, "--no-session"],
     cwd: process.cwd(),
   });
 });
@@ -119,7 +119,7 @@ describe("PiRpcProcess", () => {
       );
 
       expect((yield* rpc.request({ type: "get_state" })).data).toMatchObject({
-        sessionId: "fake-session-1",
+        sessionId: expect.stringMatching(/^fake-ephemeral-/),
         isStreaming: false,
       });
       expect((yield* rpc.request({ type: "get_available_models" })).data).toMatchObject({

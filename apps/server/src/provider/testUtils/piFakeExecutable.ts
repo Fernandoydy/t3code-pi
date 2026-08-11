@@ -13,7 +13,7 @@ export function makeFakePiExecutable(prefix: string) {
     const executable = NodePath.join(directory, "pi.cmd");
     NodeFS.writeFileSync(
       executable,
-      `@echo off\r\n"${process.execPath}" "${fakePiScript}" %*\r\n`,
+      `@echo off\r\nset "PI_FAKE_SESSION_ROOT=${directory}"\r\n"${process.execPath}" "${fakePiScript}" %*\r\n`,
       "utf8",
     );
     return { directory, executable };
@@ -22,7 +22,7 @@ export function makeFakePiExecutable(prefix: string) {
   const executable = NodePath.join(directory, "pi");
   NodeFS.writeFileSync(
     executable,
-    `#!/bin/sh\nexec "${process.execPath}" "${fakePiScript}" "$@"\n`,
+    `#!/bin/sh\nPI_FAKE_SESSION_ROOT="${directory}" exec "${process.execPath}" "${fakePiScript}" "$@"\n`,
     { encoding: "utf8", mode: 0o755 },
   );
   return { directory, executable };

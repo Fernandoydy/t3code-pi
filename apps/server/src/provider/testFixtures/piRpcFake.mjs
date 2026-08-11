@@ -1,10 +1,97 @@
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeStringDecoder from "node:string_decoder";
+import * as NodeURL from "node:url";
 
 const decoder = new NodeStringDecoder.StringDecoder("utf8");
 
 if (process.argv.includes("--version")) {
   process.stdout.write(`pi ${process.env.PI_FAKE_VERSION ?? "0.84.1"}\n`);
   process.exit(0);
+}
+
+const noSession = process.argv.includes("--no-session");
+const sessionArgIndex = process.argv.indexOf("--session");
+const requestedSessionFile = sessionArgIndex === -1 ? undefined : process.argv[sessionArgIndex + 1];
+const fakeDirectory =
+  process.env.PI_FAKE_SESSION_ROOT ??
+  NodePath.join(
+    NodeOS.tmpdir(),
+    "t3-pi-rpc-fake",
+    NodePath.basename(NodeURL.fileURLToPath(import.meta.url)),
+  );
+let sessionFile;
+let sessionId;
+let entries = [];
+let nextEntrySequence = 0;
+
+function failStartup(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function readSessionFile(filePath) {
+  if (!NodeFS.existsSync(filePath)) {
+    failStartup(`Native Pi session does not exist: ${filePath}`);
+  }
+  const contents = NodeFS.readFileSync(filePath, "utf8");
+  if (!contents.trim()) {
+    failStartup(`Native Pi session is empty: ${filePath}`);
+  }
+  try {
+    const records = contents
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const header = records[0];
+    if (header?.type !== "session" || typeof header.id !== "string") {
+      failStartup(`Native Pi session is corrupt: ${filePath}`);
+    }
+    sessionId = header.id;
+    entries = records.slice(1);
+    nextEntrySequence = entries.length;
+  } catch {
+    failStartup(`Native Pi session is corrupt: ${filePath}`);
+  }
+}
+
+function appendSessionMessage(message) {
+  if (!sessionFile) return;
+  nextEntrySequence += 1;
+  const entry = {
+    type: "message",
+    id: `fake-entry-${String(nextEntrySequence)}`,
+    parentId: entries.at(-1)?.id ?? null,
+    timestamp: new Date().toISOString(),
+    message,
+  };
+  entries.push(entry);
+  NodeFS.appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+}
+
+if (noSession) {
+  sessionId = `fake-ephemeral-${String(process.pid)}`;
+} else if (requestedSessionFile !== undefined) {
+  sessionFile = NodePath.resolve(requestedSessionFile);
+  readSessionFile(sessionFile);
+} else {
+  sessionId = process.env.PI_FAKE_SESSION_ID ?? `fake-session-${String(process.pid)}`;
+  sessionFile = NodePath.resolve(
+    process.env.PI_FAKE_SESSION_FILE ??
+      NodePath.join(fakeDirectory, "native-sessions", `${sessionId}.jsonl`),
+  );
+  NodeFS.mkdirSync(NodePath.dirname(sessionFile), { recursive: true });
+  NodeFS.writeFileSync(
+    sessionFile,
+    `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    })}\n`,
+  );
 }
 
 let input = "";
@@ -96,8 +183,9 @@ function handleCommand(command) {
         isCompacting: false,
         steeringMode: "one-at-a-time",
         followUpMode: "one-at-a-time",
-        sessionFile: "/tmp/fake-pi-session.jsonl",
-        sessionId: "fake-session-1",
+        ...(sessionFile === undefined ? {} : { sessionFile }),
+        sessionId:
+          process.env.PI_FAKE_STATE_ID_MISMATCH === "1" ? `${sessionId}-mismatch` : sessionId,
         autoCompactionEnabled: true,
         messageCount: 0,
         pendingMessageCount: 0,
@@ -223,9 +311,43 @@ function handleCommand(command) {
           },
         });
       }
+      appendSessionMessage({
+        role: "user",
+        content: String(command.message ?? ""),
+        timestamp: Date.now(),
+      });
+      appendSessionMessage({
+        role: "assistant",
+        content: [{ type: "text", text: assistantText }],
+        provider: "fake",
+        model: currentModel?.id ?? "fake-model",
+        stopReason: process.env.PI_FAKE_TURN_RESULT === "error" ? "error" : "stop",
+        timestamp: Date.now(),
+      });
+      if (process.env.PI_FAKE_MULTI_MESSAGE_HISTORY === "1") {
+        appendSessionMessage({
+          role: "toolResult",
+          toolCallId: "fake-history-tool",
+          toolName: "bash",
+          content: [{ type: "text", text: "tool output" }],
+          isError: false,
+          timestamp: Date.now(),
+        });
+        appendSessionMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "after tool" }],
+          provider: "fake",
+          model: currentModel?.id ?? "fake-model",
+          stopReason: "stop",
+          timestamp: Date.now(),
+        });
+      }
       writeJson({ type: "agent_settled" });
       break;
     }
+    case "get_entries":
+      respond(command, { entries, leafId: entries.at(-1)?.id ?? null });
+      break;
     case "steer":
       respond(command);
       writeJson({ type: "queue_update", steering: [command.message ?? ""] });
