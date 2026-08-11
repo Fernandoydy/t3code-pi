@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { HttpClient } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import type * as TextGeneration from "../../textGeneration/TextGeneration.ts";
@@ -27,7 +28,14 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
+import {
+  enrichProviderSnapshotWithVersionAdvisory,
+  makePackageManagedProviderMaintenanceResolver,
+  makeProviderMaintenanceCapabilities,
+  normalizeCommandPath,
+  resolveProviderMaintenanceCapabilitiesEffect,
+} from "../providerMaintenance.ts";
+import type { ProviderMaintenanceCapabilityResolutionOptions } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
@@ -36,12 +44,82 @@ import {
 
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const DRIVER_KIND = ProviderDriverKind.make("piAgent");
+export const PI_NPM_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+const PI_NPM_PACKAGE_PATH = `/node_modules/${PI_NPM_PACKAGE_NAME.toLowerCase()}/`;
+const PI_NATIVE_COMMAND_PATH_SUFFIXES = [
+  "/.local/bin/pi",
+  "/.local/bin/pi.exe",
+  "/.local/bin/pi.cmd",
+  "/.bun/bin/pi",
+  "/.bun/bin/pi.exe",
+  "/.local/share/pnpm/pi",
+  "/.local/share/pnpm/pi.cmd",
+  "/appdata/local/pnpm/bin/pi",
+  "/appdata/local/pnpm/bin/pi.cmd",
+  "/appdata/roaming/npm/pi",
+  "/appdata/roaming/npm/pi.cmd",
+  "/.npm-global/bin/pi",
+  "/.npm-global/bin/pi.cmd",
+  "/.yarn/bin/pi",
+  "/.yarn/bin/pi.cmd",
+  "/node_modules/.bin/pi",
+  "/node_modules/.bin/pi.cmd",
+];
+
+// Pi's self-updater can identify the package manager only for its own global
+// installation. Keep this allowlist narrow: an explicit executable elsewhere
+// gets a version advisory but must be updated manually.
+export function isPiNativeCommandPath(commandPath: string) {
+  const normalized = normalizeCommandPath(commandPath);
+  return (
+    normalized.includes(PI_NPM_PACKAGE_PATH) ||
+    PI_NATIVE_COMMAND_PATH_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
+  );
+}
+
+const PI_NATIVE_UPDATE_ACTION = {
+  executable: "pi",
+  args: ["update", "--self"],
+  lockKey: "pi-native",
+} as const;
+const PI_NATIVE_UPDATE = makeProviderMaintenanceCapabilities({
+  provider: DRIVER_KIND,
+  packageName: PI_NPM_PACKAGE_NAME,
+  updateExecutable: PI_NATIVE_UPDATE_ACTION.executable,
+  updateArgs: PI_NATIVE_UPDATE_ACTION.args,
+  updateLockKey: PI_NATIVE_UPDATE_ACTION.lockKey,
+});
+const PI_PACKAGE_UPDATE = makePackageManagedProviderMaintenanceResolver({
+  provider: DRIVER_KIND,
+  npmPackageName: PI_NPM_PACKAGE_NAME,
+  homebrewFormula: null,
+  nativeUpdate: {
+    ...PI_NATIVE_UPDATE_ACTION,
+    isCommandPath: isPiNativeCommandPath,
+  },
+});
+const PI_UPDATE = {
+  resolve: (options?: ProviderMaintenanceCapabilityResolutionOptions) => {
+    const binaryPath = options?.binaryPath?.trim().toLowerCase();
+    if (!binaryPath || binaryPath === "pi" || binaryPath === "pi.cmd" || binaryPath === "pi.exe") {
+      return PI_NATIVE_UPDATE;
+    }
+    return PI_PACKAGE_UPDATE.resolve(options);
+  },
+};
+
+export function resolvePiProviderMaintenanceCapabilities(
+  options?: ProviderMaintenanceCapabilityResolutionOptions,
+) {
+  return PI_UPDATE.resolve(options);
+}
 
 export type PiDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
+  | HttpClient.HttpClient
   | Path.Path
   | ProviderEventLoggers
   | ServerConfig
@@ -92,6 +170,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
       const serverConfig = yield* ServerConfig;
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const serverSettings = yield* ServerSettingsService;
+      const httpClient = yield* HttpClient.HttpClient;
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnvironment = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
@@ -105,10 +184,13 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const effectiveConfig = { ...config, enabled } satisfies PiSettings;
-      const maintenanceCapabilities = makeManualOnlyProviderMaintenanceCapabilities({
-        provider: DRIVER_KIND,
-        packageName: null,
-      });
+      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+        PI_UPDATE,
+        {
+          binaryPath: effectiveConfig.binaryPath,
+          env: processEnvironment,
+        },
+      );
       const adapter = yield* makePiAdapter(effectiveConfig, {
         instanceId,
         environment: processEnvironment,
@@ -130,6 +212,13 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
           Effect.map(stampIdentity),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
         ),
+        enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
+          enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
+            enableProviderUpdateChecks: settings.enableProviderUpdateChecks,
+          }).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
+          ),
       }).pipe(
         Effect.mapError(
           (cause) =>

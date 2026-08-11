@@ -70,6 +70,13 @@ that turn, and stopping it interrupts the native Pi turn without ending the sess
 expose T3 Code's permission or plan-mode
 controls.
 
+When Pi reports a newer version, T3 Code shows the advisory in provider settings. For a recognized
+package-managed installation, **Update now** runs Pi's native `pi update --self` command (or the
+matching global package-manager update when the install maps to one). Only Pi itself is touched;
+extensions, packages, credentials, settings, and model catalogs remain under Pi's control. If the
+executable uses a custom installation path that T3 Code cannot classify, use Pi's own updater
+manually from that installation.
+
 ### Binary Discovery
 
 Each provider CLI must be on the server's `PATH`, or have an explicit binary path set in
