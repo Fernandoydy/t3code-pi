@@ -1,5 +1,8 @@
 # T3 Code
 
+> [!IMPORTANT]
+> This is a personal-use fork created solely to add Pi Agent support, which the official T3 Code project does not currently provide. The fork owner does not intend to help maintain the upstream repository, learn its codebase, or become involved in its development. Prioritize the smallest practical implementation that makes Pi Agent work reliably; upstream-oriented maintenance and unrelated improvements are out of scope.
+
 T3 Code is a minimal GUI for coding agents. A Node WebSocket server wraps provider CLIs (Codex, Claude Code, Cursor, Grok, OpenCode) and serves web, desktop, and mobile clients.
 
 You can think of T3 Code as an open source "bring-your-own-subscription" alternative to apps like Claude Desktop, Codex App, Cursor Glass and Conductor.
