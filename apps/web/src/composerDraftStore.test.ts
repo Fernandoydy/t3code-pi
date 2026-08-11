@@ -24,6 +24,7 @@ const CODEX_INSTANCE = ProviderInstanceId.make("codex");
 const CODEX_SECONDARY_INSTANCE = ProviderInstanceId.make("codex_secondary");
 const CLAUDE_AGENT_INSTANCE = ProviderInstanceId.make("claudeAgent");
 const CURSOR_INSTANCE = ProviderInstanceId.make("cursor");
+const PI_INSTANCE = ProviderInstanceId.make("pi_work");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
@@ -1210,6 +1211,25 @@ describe("composerDraftStore modelSelection", () => {
         fastMode: true,
       }),
     );
+  });
+
+  it("preserves Pi model IDs and thinking levels when sent content is cleared", () => {
+    const store = useComposerDraftStore.getState();
+    const selection = createModelSelection(PI_INSTANCE, "gateway/org/model/v2", [
+      { id: "thinkingLevel", value: "max" },
+    ]);
+
+    store.setPrompt(threadRef, "send this");
+    store.setModelSelection(threadRef, selection);
+    store.clearComposerContent(threadRef);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toMatchObject({
+      prompt: "",
+      activeProvider: PI_INSTANCE,
+      modelSelectionByProvider: {
+        [PI_INSTANCE]: selection,
+      },
+    });
   });
 
   it("keeps default-only model selections on the draft", () => {

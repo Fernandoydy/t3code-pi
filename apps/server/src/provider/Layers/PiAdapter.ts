@@ -1,5 +1,6 @@
 import {
   EventId,
+  type ModelSelection,
   type PiSettings,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -9,6 +10,7 @@ import {
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -30,6 +32,11 @@ import {
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
 } from "../Errors.ts";
+import {
+  decodePiThinkingLevel,
+  parsePiModelSlug,
+  PI_THINKING_LEVEL_OPTION_ID,
+} from "../pi/PiModel.ts";
 import { makePiRpcProcess, type PiRpcWireMessage } from "../pi/PiRpcProcess.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -151,15 +158,6 @@ interface PiSessionContext {
   readonly stopped: Ref.Ref<boolean>;
 }
 
-function parsePiModelSlug(slug: string) {
-  const separator = slug.indexOf("/");
-  if (separator <= 0 || separator === slug.length - 1) return undefined;
-  return {
-    provider: slug.slice(0, separator),
-    modelId: slug.slice(separator + 1),
-  };
-}
-
 function piToolItemType(toolName: string) {
   const normalized = toolName.toLowerCase();
   if (normalized.includes("bash") || normalized.includes("command")) {
@@ -260,6 +258,77 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         threadId,
       )
       .pipe(Effect.catchCause(() => Effect.void));
+  });
+
+  const applyModelSelection = Effect.fn("PiAdapter.applyModelSelection")(function* (
+    rpc: PiSessionContext["rpc"],
+    selection: ModelSelection,
+    currentModel: string | undefined,
+  ) {
+    if (selection.instanceId !== instanceId) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "applyModelSelection",
+        issue: `Pi Agent model selection is bound to '${selection.instanceId}', expected '${instanceId}'.`,
+      });
+    }
+    const nativeModel = parsePiModelSlug(selection.model);
+    if (!nativeModel) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "applyModelSelection",
+        issue: "Pi Agent model selection must use the 'provider/model' format.",
+      });
+    }
+    const rawThinkingLevel = getModelSelectionStringOptionValue(
+      selection,
+      PI_THINKING_LEVEL_OPTION_ID,
+    );
+    const thinkingLevel =
+      rawThinkingLevel === undefined
+        ? undefined
+        : Option.getOrUndefined(decodePiThinkingLevel(rawThinkingLevel));
+    if (rawThinkingLevel !== undefined && thinkingLevel === undefined) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "applyModelSelection",
+        issue: `Unsupported Pi Agent thinking level '${rawThinkingLevel}'.`,
+      });
+    }
+    if (selection.model !== currentModel) {
+      yield* rpc
+        .request({
+          type: "set_model",
+          provider: nativeModel.provider,
+          modelId: nativeModel.modelId,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "set_model",
+                detail: cause.message,
+                cause,
+              }),
+          ),
+        );
+    }
+    // Without an explicit choice, Pi owns model-specific clamping and defaults.
+    if (thinkingLevel !== undefined) {
+      yield* rpc.request({ type: "set_thinking_level", level: thinkingLevel }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "set_thinking_level",
+              detail: cause.message,
+              cause,
+            }),
+        ),
+      );
+    }
+    return selection.model;
   });
 
   const requireSession = Effect.fn("PiAdapter.requireSession")(function* (threadId: ThreadId) {
@@ -702,25 +771,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         const currentCursor = resumeCursor
           ? yield* verifyNativeCursor(resumeCursor, observedCursor, "session/resume")
           : observedCursor;
-        if (nativeModel) {
-          yield* rpc
-            .request({
-              type: "set_model",
-              provider: nativeModel.provider,
-              modelId: nativeModel.modelId,
-            })
-            .pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "set_model",
-                    detail: cause.message,
-                    cause,
-                  }),
-              ),
-            );
-        }
+        if (selection) yield* applyModelSelection(rpc, selection, undefined);
         return currentCursor;
       }).pipe(Effect.exit);
       if (Exit.isFailure(configuredExit)) {
@@ -799,16 +850,13 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         issue: "Pi Agent attachments are not available in this provider version.",
       });
     }
-    if (
-      input.modelSelection &&
-      (input.modelSelection.instanceId !== instanceId ||
-        input.modelSelection.model !== context.session.model)
-    ) {
-      return yield* new ProviderAdapterValidationError({
-        provider: PROVIDER,
-        operation: "sendTurn",
-        issue: "Changing Pi Agent models inside a session is not available yet.",
-      });
+    if (input.modelSelection) {
+      const model = yield* applyModelSelection(
+        context.rpc,
+        input.modelSelection,
+        context.session.model,
+      );
+      yield* updateSession(context, { model });
     }
 
     const turnId = TurnId.make(`pi-turn-${yield* randomId}`);
@@ -1001,7 +1049,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
   return {
     provider: PROVIDER,
-    capabilities: { sessionModelSwitch: "unsupported" },
+    capabilities: { sessionModelSwitch: "in-session" },
     startSession,
     sendTurn,
     interruptTurn,

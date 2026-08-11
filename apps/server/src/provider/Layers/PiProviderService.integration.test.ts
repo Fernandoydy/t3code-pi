@@ -75,6 +75,13 @@ function makeTestLayer(executable: string) {
       ],
       config: { binaryPath: executable },
     },
+    [ProviderInstanceId.make("pi_models")]: {
+      driver: ProviderDriverKind.make("piAgent"),
+      displayName: "Pi Models",
+      enabled: true,
+      environment: [{ name: "PI_FAKE_SCENARIO", value: "model-selection", sensitive: false }],
+      config: { binaryPath: executable },
+    },
     [ProviderInstanceId.make("pi_personal")]: {
       driver: ProviderDriverKind.make("piAgent"),
       displayName: "Pi Personal",
@@ -299,6 +306,101 @@ describe("Pi provider through ProviderService", () => {
       );
     },
   );
+
+  it.effect("applies native model and thinking selections at start and between turns", () => {
+    const fake = makeFakePiExecutable("t3-pi-service-");
+    const instanceId = ProviderInstanceId.make("pi_models");
+    const threadId = ThreadId.make("thread-pi-model-switch");
+
+    return Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      expect(yield* provider.getCapabilities(instanceId)).toEqual({
+        sessionModelSwitch: "in-session",
+      });
+      yield* provider.startSession(threadId, {
+        threadId,
+        provider: ProviderDriverKind.make("piAgent"),
+        providerInstanceId: instanceId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: {
+          instanceId,
+          model: "gateway/org/model/v2",
+          options: [{ id: "thinkingLevel", value: "max" }],
+        },
+      });
+
+      const firstEventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.sendTurn({ threadId, input: "first" });
+      const firstEvents = Array.from(yield* Fiber.join(firstEventsFiber));
+      expect(firstEvents.find((event) => event.type === "content.delta")).toMatchObject({
+        payload: {
+          streamKind: "assistant_text",
+          delta: "selection:gateway/org/model/v2:max:first",
+        },
+      });
+
+      const secondEventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.sendTurn({
+        threadId,
+        input: "second",
+        modelSelection: {
+          instanceId,
+          model: "another/org/model/v2",
+          options: [{ id: "thinkingLevel", value: "xhigh" }],
+        },
+      });
+      const secondEvents = Array.from(yield* Fiber.join(secondEventsFiber));
+      expect(secondEvents.find((event) => event.type === "content.delta")).toMatchObject({
+        payload: {
+          streamKind: "assistant_text",
+          delta: "selection:another/org/model/v2:xhigh:second",
+        },
+      });
+
+      const thirdEventsFiber = yield* provider.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* provider.sendTurn({
+        threadId,
+        input: "third",
+        modelSelection: {
+          instanceId,
+          model: "another/org/model/v2",
+          options: [{ id: "thinkingLevel", value: "high" }],
+        },
+      });
+      const thirdEvents = Array.from(yield* Fiber.join(thirdEventsFiber));
+      expect(thirdEvents.find((event) => event.type === "content.delta")).toMatchObject({
+        payload: {
+          streamKind: "assistant_text",
+          delta: "selection:another/org/model/v2:high:third",
+        },
+      });
+      expect(yield* provider.listSessions()).toContainEqual(
+        expect.objectContaining({
+          threadId,
+          model: "another/org/model/v2",
+        }),
+      );
+    }).pipe(
+      Effect.provide(makeTestLayer(fake.executable)),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
 
   it.effect("recovers after Pi rejects a prompt before accepting it", () => {
     const fake = makeFakePiExecutable("t3-pi-service-");

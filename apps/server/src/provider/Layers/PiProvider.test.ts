@@ -51,6 +51,75 @@ describe("Pi provider snapshot", () => {
     );
   });
 
+  it.effect("publishes native model identities and only Pi-reported thinking levels", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+          PI_FAKE_MODELS: "capabilities",
+        },
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.models).toHaveLength(3);
+      expect(snapshot.models.filter((model) => model.name === "Shared Model")).toHaveLength(2);
+      expect(snapshot.models.find((model) => model.slug === "gateway/org/model/v2")).toEqual({
+        slug: "gateway/org/model/v2",
+        name: "Shared Model",
+        subProvider: "gateway",
+        isCustom: false,
+        capabilities: {
+          optionDescriptors: [
+            {
+              id: "thinkingLevel",
+              label: "Thinking",
+              type: "select",
+              options: [
+                { id: "off", label: "Off" },
+                { id: "high", label: "High" },
+                { id: "max", label: "Max" },
+              ],
+            },
+          ],
+        },
+      });
+      expect(snapshot.models.find((model) => model.slug === "another/org/model/v2")).toEqual({
+        slug: "another/org/model/v2",
+        name: "Shared Model",
+        subProvider: "another",
+        isCustom: false,
+        capabilities: {
+          optionDescriptors: [
+            {
+              id: "thinkingLevel",
+              label: "Thinking",
+              type: "select",
+              options: [
+                { id: "minimal", label: "Minimal" },
+                { id: "medium", label: "Medium" },
+                { id: "xhigh", label: "Extra High" },
+              ],
+            },
+          ],
+        },
+      });
+      expect(snapshot.models.find((model) => model.slug === "plain/text-only")).toEqual({
+        slug: "plain/text-only",
+        name: "Text Only",
+        subProvider: "plain",
+        isCustom: false,
+        capabilities: { optionDescriptors: [] },
+      });
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
   it.effect("rejects Pi versions older than the supported RPC contract", () => {
     const fake = makeFakePiExecutable("t3-pi-provider-");
     return Effect.gen(function* () {
