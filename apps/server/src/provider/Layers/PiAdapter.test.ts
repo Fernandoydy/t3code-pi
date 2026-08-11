@@ -4,7 +4,14 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { PiSettings, ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  PiSettings,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -70,6 +77,319 @@ function startInput(threadId: ThreadId, resumeCursor?: unknown) {
     ...(resumeCursor === undefined ? {} : { resumeCursor }),
   };
 }
+
+describe("PiAdapter extension UI", () => {
+  it.effect("maps select, confirm, input, and editor dialogs through user-input events", () => {
+    const fake = makeFakePiExecutable("t3-pi-extension-ui-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const cases = [
+      { method: "select", answer: "Green" },
+      { method: "confirm", answer: "Yes" },
+      { method: "input", answer: "Fernando" },
+      { method: "editor", answer: "Edited text" },
+    ] as const;
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        for (const [index, extensionCase] of cases.entries()) {
+          const threadId = ThreadId.make(`thread-pi-extension-${extensionCase.method}`);
+          const adapter = yield* makePiAdapter(settings, {
+            instanceId: INSTANCE_ID,
+            environment: {
+              ...process.env,
+              PI_FAKE_EXTENSION_METHOD: extensionCase.method,
+            },
+          });
+          const requestedFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.requested" }> =>
+                event.threadId === threadId && event.type === "user-input.requested",
+            ),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          const resolvedFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }> =>
+                event.threadId === threadId && event.type === "user-input.resolved",
+            ),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          const terminalFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (
+                event,
+              ): event is Extract<
+                ProviderRuntimeEvent,
+                { type: "turn.completed" | "turn.aborted" }
+              > =>
+                event.threadId === threadId &&
+                (event.type === "turn.completed" || event.type === "turn.aborted"),
+            ),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+
+          yield* adapter.startSession(startInput(threadId));
+          yield* adapter.sendTurn({ threadId, input: `extension ${String(index)}` });
+          const requested = yield* Fiber.join(requestedFiber);
+          expect(Option.isSome(requested)).toBe(true);
+          if (Option.isNone(requested)) continue;
+          expect(requested.value.requestId).toBe("fake-extension-1");
+          expect(requested.value.payload.questions).toHaveLength(1);
+          if (extensionCase.method === "select") {
+            expect(requested.value.payload.questions[0]?.options).toHaveLength(3);
+          } else if (extensionCase.method === "confirm") {
+            expect(
+              requested.value.payload.questions[0]?.options.map((option) => option.label),
+            ).toEqual(["Yes", "No"]);
+          } else {
+            expect(requested.value.payload.questions[0]?.options).toEqual([]);
+          }
+
+          yield* adapter.respondToUserInput(
+            threadId,
+            ApprovalRequestId.make(String(requested.value.requestId)),
+            { [String(requested.value.payload.questions[0]?.id)]: extensionCase.answer },
+          );
+          const resolved = yield* Fiber.join(resolvedFiber);
+          expect(Option.isSome(resolved)).toBe(true);
+          if (Option.isNone(resolved)) continue;
+          expect(resolved.value.payload.answers).toEqual({
+            [String(requested.value.payload.questions[0]?.id)]: extensionCase.answer,
+          });
+          expect(Option.isSome(yield* Fiber.join(terminalFiber))).toBe(true);
+        }
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("rejects select answers that were not among the offered options", () => {
+    const fake = makeFakePiExecutable("t3-pi-extension-select-invalid-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const threadId = ThreadId.make("thread-pi-extension-select-invalid");
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const adapter = yield* makePiAdapter(settings, {
+          instanceId: INSTANCE_ID,
+          environment: { ...process.env, PI_FAKE_EXTENSION_METHOD: "select" },
+        });
+        const requestedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.requested" }> =>
+              event.threadId === threadId && event.type === "user-input.requested",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "pick" });
+        const requested = yield* Fiber.join(requestedFiber);
+        expect(Option.isSome(requested)).toBe(true);
+        if (Option.isNone(requested)) return;
+
+        const invalid = yield* adapter
+          .respondToUserInput(threadId, ApprovalRequestId.make(String(requested.value.requestId)), {
+            [String(requested.value.payload.questions[0]?.id)]: "Purple",
+          })
+          .pipe(Effect.flip);
+        expect(invalid).toMatchObject({ _tag: "ProviderAdapterValidationError" });
+        expect(invalid.message).toContain("offered options");
+
+        const valid = yield* adapter.respondToUserInput(
+          threadId,
+          ApprovalRequestId.make(String(requested.value.requestId)),
+          { [String(requested.value.payload.questions[0]?.id)]: "Green" },
+        );
+        expect(valid).toBeUndefined();
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("cancels pending dialogs on interrupt and distinguishes duplicate responses", () => {
+    const fake = makeFakePiExecutable("t3-pi-extension-cancel-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const threadId = ThreadId.make("thread-pi-extension-cancel");
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const adapter = yield* makePiAdapter(settings, {
+          instanceId: INSTANCE_ID,
+          environment: { ...process.env, PI_FAKE_EXTENSION_METHOD: "input" },
+        });
+        const requestedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.requested" }> =>
+              event.threadId === threadId && event.type === "user-input.requested",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const resolvedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }> =>
+              event.threadId === threadId && event.type === "user-input.resolved",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const terminalFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              (event.type === "turn.completed" || event.type === "turn.aborted"),
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "wait for input" });
+        const requested = yield* Fiber.join(requestedFiber);
+        expect(Option.isSome(requested)).toBe(true);
+        if (Option.isNone(requested)) return;
+        const requestId = ApprovalRequestId.make(String(requested.value.requestId));
+
+        yield* adapter.interruptTurn(threadId);
+        const resolved = yield* Fiber.join(resolvedFiber);
+        expect(Option.isSome(resolved)).toBe(true);
+        if (Option.isNone(resolved)) return;
+        expect(resolved.value.payload.answers).toEqual({});
+        expect(Option.isSome(yield* Fiber.join(terminalFiber))).toBe(true);
+
+        const duplicate = yield* adapter
+          .respondToUserInput(threadId, requestId, {
+            [String(requested.value.payload.questions[0]?.id)]: "late",
+          })
+          .pipe(Effect.flip);
+        expect(duplicate).toMatchObject({ _tag: "ProviderAdapterRequestError" });
+        expect(duplicate.message).toContain("Unknown pending user-input request");
+
+        const unknown = yield* adapter
+          .respondToUserInput(threadId, ApprovalRequestId.make("unknown-extension-request"), {})
+          .pipe(Effect.flip);
+        expect(unknown).toMatchObject({ _tag: "ProviderAdapterRequestError" });
+        expect(unknown.message).toContain("Unknown pending user-input request");
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("clears a dialog when Pi resolves its native timeout", () => {
+    const fake = makeFakePiExecutable("t3-pi-extension-timeout-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const threadId = ThreadId.make("thread-pi-extension-timeout");
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const adapter = yield* makePiAdapter(settings, {
+          instanceId: INSTANCE_ID,
+          environment: {
+            ...process.env,
+            PI_FAKE_EXTENSION_METHOD: "input",
+            PI_FAKE_EXTENSION_TIMEOUT: "10",
+          },
+        });
+        const requestedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.requested" }> =>
+              event.threadId === threadId && event.type === "user-input.requested",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const resolvedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.resolved" }> =>
+              event.threadId === threadId && event.type === "user-input.resolved",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const terminalFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              (event.type === "turn.completed" || event.type === "turn.aborted"),
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        yield* adapter.startSession(startInput(threadId));
+        yield* adapter.sendTurn({ threadId, input: "native timeout" });
+        expect(Option.isSome(yield* Fiber.join(requestedFiber))).toBe(true);
+        const resolved = yield* Fiber.join(resolvedFiber);
+        expect(Option.isSome(resolved)).toBe(true);
+        if (Option.isNone(resolved)) return;
+        expect(resolved.value.payload.answers).toEqual({});
+        const terminal = yield* Fiber.join(terminalFiber);
+        expect(Option.isSome(terminal)).toBe(true);
+        if (Option.isSome(terminal)) expect(terminal.value.type).toBe("turn.completed");
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("publishes warning and error extension notifications as runtime warnings", () => {
+    const fake = makeFakePiExecutable("t3-pi-extension-notify-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const cases = ["notify-warning", "notify-error"] as const;
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        for (const method of cases) {
+          const threadId = ThreadId.make(`thread-pi-${method}`);
+          const adapter = yield* makePiAdapter(settings, {
+            instanceId: INSTANCE_ID,
+            environment: { ...process.env, PI_FAKE_EXTENSION_METHOD: method },
+          });
+          const warningFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+                event.threadId === threadId && event.type === "runtime.warning",
+            ),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          const terminalFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.threadId === threadId &&
+                (event.type === "turn.completed" || event.type === "turn.aborted"),
+            ),
+            Stream.runHead,
+            Effect.forkChild({ startImmediately: true }),
+          );
+
+          yield* adapter.startSession(startInput(threadId));
+          yield* adapter.sendTurn({ threadId, input: method });
+          const warning = yield* Fiber.join(warningFiber);
+          expect(Option.isSome(warning)).toBe(true);
+          if (Option.isNone(warning)) continue;
+          expect(warning.value.payload.message).toBe(`fake ${method}`);
+          expect(Option.isSome(yield* Fiber.join(terminalFiber))).toBe(true);
+        }
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+});
 
 describe("PiAdapter durable sessions", () => {
   it.effect("resumes the exact native session file and rebuilds its thread snapshot", () => {

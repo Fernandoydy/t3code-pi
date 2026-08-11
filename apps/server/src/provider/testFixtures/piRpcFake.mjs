@@ -99,6 +99,7 @@ let currentModel = null;
 let currentThinkingLevel = "medium";
 let promptCount = 0;
 let emitLateAbortEventsOnNextPrompt = false;
+let pendingExtensionRequest = null;
 const deferredResponses = [];
 const outputQueue = [];
 let outputActive = false;
@@ -188,6 +189,16 @@ function writeLateAbortEvents() {
 }
 
 function handleCommand(command) {
+  if (command.type === "extension_ui_response") {
+    const matches = pendingExtensionRequest?.id === command.id;
+    writeJson({ type: "extension_response_received", id: command.id, matches });
+    if (matches) {
+      pendingExtensionRequest = null;
+      writeJson({ type: "agent_settled" });
+    }
+    return;
+  }
+
   switch (command.type) {
     case "test_deferred_response":
       deferredResponses.push(command);
@@ -305,6 +316,47 @@ function handleCommand(command) {
         writeLateAbortEvents();
       }
       writeJson({ type: "agent_start" });
+      const extensionMethod = process.env.PI_FAKE_EXTENSION_METHOD;
+      if (extensionMethod === "notify-warning" || extensionMethod === "notify-error") {
+        writeJson({
+          type: "extension_ui_request",
+          id: `fake-extension-${String(promptCount)}`,
+          method: "notify",
+          message: `fake ${extensionMethod}`,
+          notifyType: extensionMethod === "notify-error" ? "error" : "warning",
+        });
+        writeJson({ type: "agent_settled" });
+        break;
+      }
+      if (["select", "confirm", "input", "editor"].includes(extensionMethod ?? "")) {
+        const request = {
+          type: "extension_ui_request",
+          id: `fake-extension-${String(promptCount)}`,
+          method: extensionMethod,
+          ...(extensionMethod === "select"
+            ? { title: "Pick a color", options: ["Red", "Green", "Blue"] }
+            : extensionMethod === "confirm"
+              ? { title: "Continue?", message: "Continue the fake turn?" }
+              : extensionMethod === "input"
+                ? { title: "Name", placeholder: "Your name" }
+                : { title: "Edit text", prefill: "Initial text" }),
+          ...(process.env.PI_FAKE_EXTENSION_TIMEOUT
+            ? { timeout: Number(process.env.PI_FAKE_EXTENSION_TIMEOUT) }
+            : {}),
+        };
+        pendingExtensionRequest = { id: request.id };
+        writeJson(request);
+        const extensionTimeout = Number(request.timeout ?? 0);
+        if (extensionTimeout > 0) {
+          setTimeout(() => {
+            if (pendingExtensionRequest?.id !== request.id) return;
+            pendingExtensionRequest = null;
+            writeJson({ type: "fake_extension_timed_out", id: request.id });
+            writeJson({ type: "agent_settled" });
+          }, extensionTimeout);
+        }
+        break;
+      }
       const shouldWaitForAbort =
         process.env.PI_FAKE_WAIT_FOR_ABORT === "1" ||
         (process.env.PI_FAKE_WAIT_FOR_ABORT_ONCE === "1" && promptCount === 1);

@@ -63,6 +63,28 @@ describe("PiRpcProcess", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("writes fire-and-forget extension responses without awaiting an RPC response", () =>
+    Effect.gen(function* () {
+      const rpc = yield* makeFakePi();
+      expect((yield* rpc.request({ type: "get_state" })).success).toBe(true);
+
+      yield* rpc.write({
+        type: "extension_ui_response",
+        id: "extension-request-1",
+        value: "Green",
+      });
+
+      expect(yield* Stream.runHead(rpc.events)).toMatchObject({
+        _tag: "Some",
+        value: {
+          type: "extension_response_received",
+          id: "extension-request-1",
+          matches: false,
+        },
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("frames stdout only on LF across arbitrary byte chunks", () =>
     Effect.gen(function* () {
       const rpc = yield* makeFakePi();
