@@ -38,7 +38,7 @@ import type { ThreadSettingsSheetCloseReason } from "./use-thread-settings-sheet
  * catalogs and friends) folds behind its header so a 300-model catalog can't
  * bury the list.
  */
-const PRIMARY_PROVIDER_DRIVERS: ReadonlySet<string> = new Set(["claudeAgent", "codex"]);
+const PRIMARY_PROVIDER_DRIVERS: ReadonlySet<string> = new Set(["claudeAgent", "codex", "piAgent"]);
 
 /**
  * Desktop-oriented effort keywords that don't belong in the phone picker.
@@ -69,12 +69,13 @@ export function threadSettingsSummaryLabel(input: {
   readonly optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
+  readonly showRuntimeModeToggle?: boolean;
 }): string {
   const runtime = RUNTIME_MODE_CHOICES.find((choice) => choice.mode === input.runtimeMode);
   return [
     input.modelLabel,
     ...providerOptionValueLabels(input.optionDescriptors),
-    ...(runtime ? [runtime.shortLabel] : []),
+    ...(input.showRuntimeModeToggle !== false && runtime ? [runtime.shortLabel] : []),
     ...(input.interactionMode === "plan" ? ["Plan"] : []),
   ].join(" · ");
 }
@@ -355,6 +356,9 @@ export function ThreadSettingsSheet(props: {
   // While a model is staged, the settings rows describe and edit the staged
   // model's options (kept on its pending selection); Save applies model and
   // options together. Otherwise they edit the applied selection directly.
+  const displayedModel =
+    pendingModel ?? props.providerGroups.flatMap((group) => group.models).find(isApplied);
+  const showRuntimeModeToggle = displayedModel?.showRuntimeModeToggle !== false;
   const displayedDescriptors = pendingModel
     ? pendingModel.capabilities
       ? getProviderOptionDescriptors({
@@ -444,7 +448,7 @@ export function ThreadSettingsSheet(props: {
       : undefined;
 
   const submenuContent =
-    submenu?.kind === "runtime"
+    submenu?.kind === "runtime" && showRuntimeModeToggle
       ? {
           title: "Runtime",
           rows: RUNTIME_MODE_CHOICES.map((choice) => ({
@@ -614,13 +618,15 @@ export function ThreadSettingsSheet(props: {
                 />
               );
             })}
-            <DisclosureRow
-              label="Runtime"
-              value={
-                RUNTIME_MODE_CHOICES.find((choice) => choice.mode === props.runtimeMode)?.label
-              }
-              onPress={() => setSubmenu({ kind: "runtime" })}
-            />
+            {showRuntimeModeToggle ? (
+              <DisclosureRow
+                label="Runtime"
+                value={
+                  RUNTIME_MODE_CHOICES.find((choice) => choice.mode === props.runtimeMode)?.label
+                }
+                onPress={() => setSubmenu({ kind: "runtime" })}
+              />
+            ) : null}
             <Pressable
               accessibilityRole="button"
               onPress={handleSave}

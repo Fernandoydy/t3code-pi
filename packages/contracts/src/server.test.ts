@@ -47,6 +47,19 @@ describe("ServerProvider", () => {
     expect(parsed.updateState).toBeUndefined();
   });
 
+  it("decodes provider-specific mode-control visibility", () => {
+    const parsed = decodeServerProvider({
+      ...baseProviderSnapshot,
+      instanceId: "piAgent",
+      driver: "piAgent",
+      showInteractionModeToggle: false,
+      showRuntimeModeToggle: false,
+    });
+
+    expect(parsed.showInteractionModeToggle).toBe(false);
+    expect(parsed.showRuntimeModeToggle).toBe(false);
+  });
+
   it("defaults one-click update support when decoding older advisory snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",

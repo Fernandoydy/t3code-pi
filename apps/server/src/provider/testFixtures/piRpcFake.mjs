@@ -1,7 +1,15 @@
 import * as NodeStringDecoder from "node:string_decoder";
 
 const decoder = new NodeStringDecoder.StringDecoder("utf8");
+
+if (process.argv.includes("--version")) {
+  process.stdout.write(`pi ${process.env.PI_FAKE_VERSION ?? "0.84.1"}\n`);
+  process.exit(0);
+}
+
 let input = "";
+let currentModel = null;
+let promptCount = 0;
 const deferredResponses = [];
 const outputQueue = [];
 let outputActive = false;
@@ -82,7 +90,7 @@ function handleCommand(command) {
       break;
     case "get_state":
       respond(command, {
-        model: null,
+        model: currentModel,
         thinkingLevel: "medium",
         isStreaming: false,
         isCompacting: false,
@@ -95,37 +103,129 @@ function handleCommand(command) {
         pendingMessageCount: 0,
       });
       break;
+    case "set_model":
+      currentModel = {
+        provider: String(command.provider ?? "fake"),
+        id: String(command.modelId ?? "fake-model"),
+      };
+      respond(command, currentModel);
+      break;
     case "get_available_models":
       respond(command, {
-        models: [
-          {
-            provider: "fake",
-            id: "fake-model",
-            name: "Fake Model",
-            api: "fake",
-            baseUrl: "https://example.invalid",
-            reasoning: true,
-            input: ["text", "image"],
-            contextWindow: 128000,
-            maxTokens: 8192,
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          },
-        ],
+        models:
+          process.env.PI_FAKE_MODELS === "empty"
+            ? []
+            : [
+                {
+                  provider: "fake",
+                  id: "fake-model",
+                  name: "Fake Model",
+                  api: "fake",
+                  baseUrl: "https://example.invalid",
+                  reasoning: true,
+                  input: ["text", "image"],
+                  contextWindow: 128000,
+                  maxTokens: 8192,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                },
+              ],
       });
       break;
-    case "prompt":
+    case "prompt": {
+      promptCount += 1;
+      if (process.env.PI_FAKE_REJECT_FIRST_PROMPT === "1" && promptCount === 1) {
+        reject(command, "rejected first fake prompt");
+        break;
+      }
+      const assistantText =
+        process.env.PI_FAKE_SCENARIO === "basic-turn"
+          ? `fake:${command.message ?? ""}:${process.cwd()}:${process.env.PI_FAKE_MARKER ?? ""}:${process.argv.slice(2).join(",")}`
+          : `fake:${command.message ?? ""}`;
       respond(command);
       writeJson({ type: "agent_start" });
-      writeJson({
-        type: "message_update",
-        assistantMessageEvent: {
-          type: "text_delta",
-          contentIndex: 0,
-          delta: `fake:${command.message ?? ""}`,
-        },
-      });
+      if (process.env.PI_FAKE_WAIT_FOR_ABORT === "1") break;
+      if (process.env.PI_FAKE_SCENARIO === "basic-turn") {
+        writeJson({ type: "turn_start" });
+        writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
+        writeJson({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "thinking_delta",
+            contentIndex: 0,
+            delta: "considering",
+          },
+        });
+        writeJson({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 1,
+            delta: assistantText,
+          },
+        });
+        writeJson({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "considering" },
+              { type: "text", text: assistantText },
+            ],
+          },
+        });
+        writeJson({ type: "agent_end", messages: [], willRetry: false });
+        writeJson({
+          type: "tool_execution_start",
+          toolCallId: "fake-tool-1",
+          toolName: "bash",
+          args: { command: "echo fake" },
+        });
+        writeJson({
+          type: "tool_execution_update",
+          toolCallId: "fake-tool-1",
+          toolName: "bash",
+          args: { command: "echo fake" },
+          partialResult: { content: [{ type: "text", text: "fake" }] },
+        });
+        writeJson({
+          type: "tool_execution_end",
+          toolCallId: "fake-tool-1",
+          toolName: "bash",
+          result: { content: [{ type: "text", text: "fake" }] },
+          isError: false,
+        });
+        writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
+        writeJson({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "done",
+          },
+        });
+        writeJson({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+            ...(process.env.PI_FAKE_TURN_RESULT === "error"
+              ? { stopReason: "error", errorMessage: "fake model failure" }
+              : {}),
+          },
+        });
+      } else {
+        writeJson({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: assistantText,
+          },
+        });
+      }
       writeJson({ type: "agent_settled" });
       break;
+    }
     case "steer":
       respond(command);
       writeJson({ type: "queue_update", steering: [command.message ?? ""] });

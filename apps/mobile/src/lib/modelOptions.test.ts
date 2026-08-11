@@ -51,6 +51,51 @@ describe("mobile model options", () => {
     ]);
   });
 
+  it("renders Pi Agent models with an explicit provider identity", () => {
+    const config = {
+      providers: [
+        {
+          instanceId: "pi_work",
+          driver: "piAgent",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          showRuntimeModeToggle: false,
+          models: [
+            {
+              slug: "fake/fake-model",
+              name: "Fake Model",
+              isCustom: false,
+              capabilities: null,
+            },
+          ],
+        },
+      ],
+    } as unknown as ServerConfig;
+
+    expect(buildModelOptions(config, null)).toMatchObject([
+      {
+        providerKey: "pi_work",
+        providerLabel: "Pi Agent",
+        providerDriver: "piAgent",
+        label: "Fake Model",
+        showRuntimeModeToggle: false,
+      },
+    ]);
+  });
+
+  it("keeps the default Pi identity explicit while an environment is offline", () => {
+    const [option] = buildModelOptions(null, {
+      instanceId: ProviderInstanceId.make("piAgent"),
+      model: "fake/fake-model",
+    });
+
+    expect(option).toMatchObject({
+      providerLabel: "Pi Agent",
+      providerDriver: "piAgent",
+    });
+  });
+
   it("normalizes a legacy fallback selection against current capabilities", () => {
     const config = {
       providers: [

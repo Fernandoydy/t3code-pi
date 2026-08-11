@@ -152,6 +152,35 @@ describe("instance-scoped model selection", () => {
     ).toBe("opus");
   });
 
+  it("uses Pi native inventory without injecting Codex defaults", () => {
+    const instanceId = ProviderInstanceId.make("pi_work");
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("piAgent"),
+        instanceId,
+        models: ["fake/fake-model"],
+      }),
+    ];
+    const settings: UnifiedSettings = {
+      ...settingsWithProviderInstances(),
+      providerInstances: {
+        ...settingsWithProviderInstances().providerInstances,
+        [instanceId]: {
+          driver: ProviderDriverKind.make("piAgent"),
+          config: { binaryPath: "pi" },
+        },
+      },
+    };
+    const pi = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(getAppModelOptionsForInstance(settings, pi).map((option) => option.slug)).toEqual([
+      "fake/fake-model",
+    ]);
+    expect(
+      resolveAppModelSelectionForInstance(instanceId, settings, providers, "fake/fake-model"),
+    ).toBe("fake/fake-model");
+  });
+
   it("includes Grok custom models from the selected provider instance", () => {
     const providers = [provider({ provider: ProviderDriverKind.make("grok"), instanceId: "grok" })];
     const settings: UnifiedSettings = {

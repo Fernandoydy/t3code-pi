@@ -15,6 +15,7 @@ export type ModelOption = {
   readonly providerKey: string;
   readonly providerLabel: string;
   readonly providerDriver: string;
+  readonly showRuntimeModeToggle?: boolean;
   readonly isDefault: boolean;
   readonly isLegacy: boolean;
   readonly capabilities: ModelCapabilities | null;
@@ -35,6 +36,7 @@ function providerDisplayLabel(provider: {
   if (provider.displayName) return provider.displayName;
   if (provider.driver === "codex") return "Codex";
   if (provider.driver === "claudeAgent") return "Claude";
+  if (provider.driver === "piAgent") return "Pi Agent";
   return provider.instanceId;
 }
 
@@ -125,6 +127,7 @@ export function buildModelOptions(
         providerKey: provider.instanceId,
         providerLabel,
         providerDriver: provider.driver,
+        showRuntimeModeToggle: provider.showRuntimeModeToggle !== false,
         isDefault: model.isDefault === true,
         isLegacy: model.isLegacy === true,
         capabilities: model.capabilities,
@@ -148,7 +151,10 @@ export function buildModelOptions(
         selection: normalizeSelectionOptions(fallbackModelSelection, existing.capabilities),
       });
     } else {
-      const providerLabel = fallbackModelSelection.instanceId;
+      const providerLabel =
+        fallbackModelSelection.instanceId === "piAgent"
+          ? "Pi Agent"
+          : fallbackModelSelection.instanceId;
       options.set(key, {
         key,
         label: fallbackModelSelection.model,
@@ -156,6 +162,7 @@ export function buildModelOptions(
         providerKey: fallbackModelSelection.instanceId,
         providerLabel,
         providerDriver: fallbackModelSelection.instanceId,
+        showRuntimeModeToggle: true,
         isDefault: false,
         isLegacy: false,
         capabilities: null,

@@ -1,0 +1,125 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { it } from "@effect/vitest";
+import { PiSettings } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import { describe, expect } from "vite-plus/test";
+
+import { makeFakePiExecutable } from "../testUtils/piFakeExecutable.ts";
+import { checkPiProviderStatus } from "./PiProvider.ts";
+
+const decodePiSettings = Schema.decodeSync(PiSettings);
+
+describe("Pi provider snapshot", () => {
+  it.effect("reports a ready Pi installation from version and RPC model inventory", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+        },
+      );
+
+      expect(snapshot).toMatchObject({
+        displayName: "Pi Agent",
+        enabled: true,
+        installed: true,
+        version: "0.84.1",
+        status: "ready",
+        auth: { status: "authenticated", type: "pi" },
+        showInteractionModeToggle: false,
+        showRuntimeModeToggle: false,
+      });
+      expect(snapshot.models).toEqual([
+        expect.objectContaining({
+          slug: "fake/fake-model",
+          name: "Fake Model",
+          subProvider: "fake",
+          isCustom: false,
+        }),
+      ]);
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
+  it.effect("rejects Pi versions older than the supported RPC contract", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        { ...process.env, PI_FAKE_VERSION: "0.84.0" },
+      );
+
+      expect(snapshot).toMatchObject({
+        installed: true,
+        version: "0.84.0",
+        status: "error",
+        auth: { status: "unknown" },
+      });
+      expect(snapshot.message).toContain("too old");
+      expect(snapshot.models).toEqual([]);
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
+  it.effect("reports an actionable warning when Pi has no configured models", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+          PI_FAKE_MODELS: "empty",
+        },
+      );
+
+      expect(snapshot).toMatchObject({
+        installed: true,
+        version: "0.84.1",
+        status: "warning",
+        auth: { status: "unknown", type: "pi" },
+        models: [],
+      });
+      expect(snapshot.message).toContain("Configure authentication and models in Pi itself");
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
+  it.effect("reports a missing configured executable as not installed", () =>
+    Effect.gen(function* () {
+      const missing = NodePath.join(
+        NodeOS.tmpdir(),
+        `missing-pi-${String(process.pid)}-not-present`,
+      );
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: missing }),
+        process.cwd(),
+        process.env,
+      );
+
+      expect(snapshot).toMatchObject({
+        installed: false,
+        version: null,
+        status: "error",
+        auth: { status: "unknown" },
+      });
+      expect(snapshot.message).toContain("not installed or not on PATH");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
