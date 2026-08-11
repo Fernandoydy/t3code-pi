@@ -33,6 +33,7 @@ import { ProviderInstanceRegistryLayer } from "./ProviderInstanceRegistryLive.ts
 import { makeProviderServiceLive } from "./ProviderService.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
+import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import { makeFakePiExecutable } from "../testUtils/piFakeExecutable.ts";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
@@ -212,6 +213,65 @@ function makeTestLayer(
 }
 
 describe("Pi provider through ProviderService", () => {
+  it.effect("generates thread titles and branch names with Pi as the only enabled provider", () => {
+    const fake = makeFakePiExecutable("t3-pi-text-only-");
+    const instanceId = ProviderInstanceId.make("pi_text_only");
+    const configMap: ProviderInstanceConfigMap = {
+      [instanceId]: {
+        driver: ProviderDriverKind.make("piAgent"),
+        displayName: "Pi Text Only",
+        enabled: true,
+        environment: [
+          {
+            name: "PI_FAKE_TEXT_GENERATION_OUTPUT",
+            value: JSON.stringify({ title: "Pi-only metadata", branch: "pi-only-metadata" }),
+            sensitive: false,
+          },
+        ],
+        config: { binaryPath: fake.executable },
+      },
+    };
+    const settingsLayer = ServerSettings.ServerSettingsService.layerTest({
+      providerInstances: configMap,
+    });
+    const infrastructure = ServerConfig.layerTest(process.cwd(), {
+      prefix: "pi-text-only-test-",
+    }).pipe(
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+      Layer.provideMerge(settingsLayer),
+      Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
+    );
+    const textGenerationLayer = TextGeneration.layer.pipe(
+      Layer.provide(
+        ProviderInstanceRegistryLayer({ drivers: [PiDriver], configMap }).pipe(
+          Layer.provide(infrastructure),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const textGeneration = yield* TextGeneration.TextGeneration;
+      const title = yield* textGeneration.generateThreadTitle({
+        cwd: process.cwd(),
+        message: "Create a thread in a Pi-only installation",
+        modelSelection: { instanceId, model: "auto" },
+      });
+      expect(title).toEqual({ title: "Pi-only metadata" });
+      const branch = yield* textGeneration.generateBranchName({
+        cwd: process.cwd(),
+        message: "Create a branch in a Pi-only installation",
+        modelSelection: { instanceId, model: "auto" },
+      });
+      expect(branch).toEqual({ branch: "pi-only-metadata" });
+    }).pipe(
+      Effect.provide(textGenerationLayer),
+      Effect.ensuring(
+        Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true, force: true })),
+      ),
+    );
+  });
+
   it.effect("runs a selected native model until agent_settled and publishes canonical work", () => {
     const fake = makeFakePiExecutable("t3-pi-service-");
     const instanceId = ProviderInstanceId.make("pi_work");

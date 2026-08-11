@@ -1,9 +1,4 @@
-import {
-  PiSettings,
-  ProviderDriverKind,
-  TextGenerationError,
-  type ServerProvider,
-} from "@t3tools/contracts";
+import { PiSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -11,7 +6,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import type * as TextGeneration from "../../textGeneration/TextGeneration.ts";
+import { makePiTextGeneration } from "../../textGeneration/PiTextGeneration.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -63,22 +58,6 @@ const withInstanceIdentity =
     continuation: { groupKey: input.continuationGroupKey },
   });
 
-function unsupportedTextGeneration(): TextGeneration.TextGeneration["Service"] {
-  const unsupported = (operation: string) =>
-    Effect.fail(
-      new TextGenerationError({
-        operation,
-        detail: "Pi Agent auxiliary text generation is not available yet.",
-      }),
-    );
-  return {
-    generateCommitMessage: () => unsupported("generateCommitMessage"),
-    generatePrContent: () => unsupported("generatePrContent"),
-    generateBranchName: () => unsupported("generateBranchName"),
-    generateThreadTitle: () => unsupported("generateThreadTitle"),
-  };
-}
-
 export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -113,6 +92,10 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         instanceId,
         environment: processEnvironment,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+      });
+      const textGeneration = yield* makePiTextGeneration(effectiveConfig, {
+        instanceId,
+        environment: processEnvironment,
       });
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<PiSettings>>({
@@ -151,7 +134,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         enabled,
         snapshot,
         adapter,
-        textGeneration: unsupportedTextGeneration(),
+        textGeneration,
       } satisfies ProviderInstance;
     }),
 };

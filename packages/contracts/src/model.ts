@@ -163,6 +163,8 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  // Pi's own configured default model is authoritative; "auto" keeps it.
+  [ProviderDriverKind.make("piAgent")]: "auto",
 };
 
 export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
