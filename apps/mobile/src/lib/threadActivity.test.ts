@@ -13,6 +13,7 @@ import {
 
 import {
   buildThreadFeed,
+  derivePendingUserInputs,
   deriveThreadFeedPresentation,
   type ThreadFeedActivity,
   type ThreadFeedEntry,
@@ -530,6 +531,36 @@ describe("buildThreadFeed", () => {
       type: "work-toggle",
       expanded: true,
     });
+  });
+});
+
+describe("derivePendingUserInputs", () => {
+  it("keeps free-form input prompts that do not have selectable options", () => {
+    const activities = [
+      makeActivity({
+        id: EventId.make("pi-input-open"),
+        kind: "user-input.requested",
+        summary: "User input requested",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        payload: {
+          requestId: "pi-input-1",
+          questions: [
+            {
+              id: "pi-input-1",
+              header: "Name",
+              question: "What is your name?",
+              options: [],
+              multiSelect: false,
+            },
+          ],
+        },
+      }),
+    ];
+
+    const pending = derivePendingUserInputs(activities);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.requestId).toBe("pi-input-1");
+    expect(pending[0]?.questions[0]?.options).toEqual([]);
   });
 });
 

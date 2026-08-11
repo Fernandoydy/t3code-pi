@@ -530,6 +530,35 @@ export const makePiRpcProcess = Effect.fn("PiRpcProcess.make")(function* (
     });
   });
 
+  const write = Effect.fn("PiRpcProcess.write")(function* (command: PiRpcCommand) {
+    const requestId = command.id ?? "untracked";
+    const line = yield* encodeCommand(command).pipe(
+      Effect.mapError(
+        (cause) =>
+          new PiRpcCommandEncodingError({
+            command: command.type,
+            requestId,
+            cause,
+          }),
+      ),
+      Effect.map((json) => `${json}\n`),
+    );
+    const state = (yield* Ref.get(contextRef)).state;
+    if (state._tag !== "Open") {
+      return yield* new PiRpcRequestUnresolvedError({
+        command: command.type,
+        requestId,
+        reason: state._tag === "Failed" ? unresolvedReason(state.error) : "scope-closed",
+        ...(state._tag === "Failed" ? { cause: state.error } : {}),
+      });
+    }
+    yield* Queue.offer(writeQueue, {
+      command: command.type,
+      requestId,
+      line,
+    });
+  });
+
   const request = Effect.fn("PiRpcProcess.request")(function* (command: PiRpcCommand) {
     const response = yield* Deferred.make<PiRpcSuccessResponse, PiRpcRequestError>();
     const registration = yield* Ref.modify(
@@ -597,6 +626,7 @@ export const makePiRpcProcess = Effect.fn("PiRpcProcess.make")(function* (
   return {
     pid: Number(child.pid),
     request,
+    write,
     events: Stream.fromQueue(eventQueue).pipe(Stream.flattenTake),
     getStderr: Ref.get(stderrRef),
   };

@@ -304,6 +304,46 @@ describe("derivePendingUserInputs", () => {
     ]);
   });
 
+  it("keeps free-form input prompts that do not have selectable options", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "pi-input-open",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        tone: "info",
+        payload: {
+          requestId: "pi-input-1",
+          questions: [
+            {
+              id: "pi-input-1",
+              header: "Name",
+              question: "What is your name?",
+              options: [],
+              multiSelect: false,
+            },
+          ],
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([
+      {
+        requestId: "pi-input-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        questions: [
+          {
+            id: "pi-input-1",
+            header: "Name",
+            question: "What is your name?",
+            options: [],
+            multiSelect: false,
+          },
+        ],
+      },
+    ]);
+  });
+
   it("clears stale pending user-input prompts when the provider reports an orphaned request", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
