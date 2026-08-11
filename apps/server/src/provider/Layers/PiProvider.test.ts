@@ -120,6 +120,77 @@ describe("Pi provider snapshot", () => {
     );
   });
 
+  it.effect("publishes native slash commands while keeping the T3 skills list empty", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+        },
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.slashCommands).toEqual([
+        { name: "fix-tests", description: "Fix the failing test suite" },
+        { name: "summarize", description: "Summarize the recent changes" },
+        { name: "skill:web-search", description: "Search the web for current information" },
+      ]);
+      expect(snapshot.skills).toEqual([]);
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
+  it.effect("keeps the provider ready when Pi reports an empty command inventory", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+          PI_FAKE_COMMANDS: "empty",
+        },
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.slashCommands).toEqual([]);
+      expect(snapshot.message).toContain("available through Pi Agent");
+      expect(snapshot.message).not.toContain("unavailable");
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
+  it.effect("degrades the command inventory without failing the provider", () => {
+    const fake = makeFakePiExecutable("t3-pi-provider-");
+    return Effect.gen(function* () {
+      const snapshot = yield* checkPiProviderStatus(
+        decodePiSettings({ enabled: true, binaryPath: fake.executable }),
+        process.cwd(),
+        {
+          ...process.env,
+          PI_FAKE_VERSION: "0.84.1",
+          PI_FAKE_COMMANDS: "fail",
+        },
+      );
+
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.models).toHaveLength(1);
+      expect(snapshot.slashCommands).toEqual([]);
+      expect(snapshot.message).toContain("Slash-command inventory is unavailable.");
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+      Effect.provide(NodeServices.layer),
+    );
+  });
+
   it.effect("rejects Pi versions older than the supported RPC contract", () => {
     const fake = makeFakePiExecutable("t3-pi-provider-");
     return Effect.gen(function* () {

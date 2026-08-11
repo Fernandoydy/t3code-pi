@@ -309,6 +309,68 @@ function handleCommand(command) {
       respond(command, { levels });
       break;
     }
+    case "get_commands":
+      if (process.env.PI_FAKE_COMMANDS === "fail") {
+        reject(command, "fake command inventory failure");
+        break;
+      }
+      if (process.env.PI_FAKE_COMMANDS === "empty") {
+        respond(command, { commands: [] });
+        break;
+      }
+      respond(command, {
+        commands: [
+          {
+            name: "fix-tests",
+            description: "Fix the failing test suite",
+            source: "extension",
+            sourceInfo: {
+              path: "/home/user/.pi/agent/extensions/fix-tests.ts",
+              source: "auto",
+              scope: "user",
+              origin: "top-level",
+              baseDir: "/home/user/.pi/agent",
+            },
+          },
+          {
+            name: "summarize",
+            description: "Summarize the recent changes",
+            source: "prompt",
+            sourceInfo: {
+              path: "/home/user/project/.pi/agent/prompts/summarize.md",
+              source: "auto",
+              scope: "project",
+              origin: "top-level",
+              baseDir: "/home/user/project",
+            },
+          },
+          {
+            name: "skill:web-search",
+            description: "Search the web for current information",
+            source: "skill",
+            sourceInfo: {
+              path: "/home/user/.pi/agent/skills/web-search/SKILL.md",
+              source: "auto",
+              scope: "user",
+              origin: "top-level",
+              baseDir: "/home/user/.pi/agent",
+            },
+          },
+          {
+            name: "fix-tests",
+            description: "Project prompt template that collides with an extension",
+            source: "prompt",
+            sourceInfo: {
+              path: "/home/user/project/.pi/agent/prompts/fix-tests.md",
+              source: "auto",
+              scope: "project",
+              origin: "top-level",
+              baseDir: "/home/user/project",
+            },
+          },
+        ],
+      });
+      break;
     case "set_thinking_level":
       currentThinkingLevel = String(command.level ?? "off");
       respond(command);

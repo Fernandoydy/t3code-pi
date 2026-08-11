@@ -1,4 +1,8 @@
-import { PiSettings, type ServerProviderModel } from "@t3tools/contracts";
+import {
+  PiSettings,
+  type ServerProviderModel,
+  type ServerProviderSlashCommand,
+} from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
@@ -19,6 +23,7 @@ import { makePiRpcProcess } from "../pi/PiRpcProcess.ts";
 import {
   buildServerProvider,
   isCommandMissingCause,
+  nonEmptyTrimmed,
   parseGenericCliVersion,
   spawnAndCollect,
   type ServerProviderDraft,
@@ -27,6 +32,7 @@ import {
 const MINIMUM_PI_VERSION = "0.84.1";
 const PI_PROBE_TIMEOUT_MS = 4_000;
 const PI_INVENTORY_TIMEOUT_MS = 15_000;
+const PI_COMMAND_INVENTORY_TIMEOUT_MS = 10_000;
 const PI_PRESENTATION = {
   displayName: "Pi Agent",
   showInteractionModeToggle: false,
@@ -44,6 +50,18 @@ const PiInventoryModel = Schema.Struct({
 });
 const PiInventory = Schema.Struct({ models: Schema.Array(PiInventoryModel) });
 const decodePiInventory = Schema.decodeUnknownEffect(PiInventory);
+
+// Pi's `get_commands` payload. Only name and description are consumed;
+// `source` (extension/prompt/skill) and `sourceInfo` (path, scope) stay native
+// metadata and are stripped here.
+const PiSlashCommand = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+});
+const PiCommandInventory = Schema.Struct({
+  commands: Schema.Array(PiSlashCommand),
+});
+const decodePiCommandInventory = Schema.decodeUnknownEffect(PiCommandInventory);
 const PiModelInventory = Schema.Array(
   Schema.Struct({
     model: PiInventoryModel,
@@ -110,7 +128,29 @@ const runPiVersionCommand = (settings: PiSettings, environment: NodeJS.ProcessEn
     );
   });
 
-const loadPiInventory = (settings: PiSettings, cwd: string, environment: NodeJS.ProcessEnv) =>
+// Best-effort command inventory. Failures (including older Pi builds without
+// `get_commands`) degrade to an empty slash-command list and must never fail
+// the provider status check: Pi remains fully usable for ordinary chat.
+const loadPiCommandInventory = (
+  settings: PiSettings,
+  cwd: string,
+  environment: NodeJS.ProcessEnv,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const rpc = yield* makePiRpcProcess({
+        command: configuredPiCommand(settings),
+        args: ["--mode", "rpc", "--no-session"],
+        cwd,
+        environment,
+      });
+      const response = yield* rpc.request({ type: "get_commands" });
+      const inventory = yield* decodePiCommandInventory(response.data);
+      return inventory.commands;
+    }),
+  );
+
+const loadPiModelInventory = (settings: PiSettings, cwd: string, environment: NodeJS.ProcessEnv) =>
   Effect.scoped(
     Effect.gen(function* () {
       const rpc = yield* makePiRpcProcess({
@@ -144,6 +184,24 @@ const loadPiInventory = (settings: PiSettings, cwd: string, environment: NodeJS.
       });
     }),
   );
+
+function piSlashCommandsFromInventory(commands: ReadonlyArray<typeof PiSlashCommand.Type>) {
+  const seen = new Set<string>();
+  const slashCommands: Array<ServerProviderSlashCommand> = [];
+  for (const command of commands) {
+    const name = command.name.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const description = nonEmptyTrimmed(command.description);
+    slashCommands.push({
+      name,
+      ...(description ? { description } : {}),
+    });
+  }
+  return slashCommands;
+}
 
 export function buildInitialPiProviderSnapshot(settings: PiSettings) {
   return Effect.gen(function* () {
@@ -246,7 +304,7 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
     });
   }
 
-  const inventoryResult = yield* loadPiInventory(settings, cwd, environment).pipe(
+  const inventoryResult = yield* loadPiModelInventory(settings, cwd, environment).pipe(
     Effect.timeoutOption(PI_INVENTORY_TIMEOUT_MS),
     Effect.result,
   );
@@ -267,11 +325,29 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
   }
 
   const models = piModelsFromInventory(inventoryResult.success.value);
+
+  const commandInventoryResult = yield* loadPiCommandInventory(settings, cwd, environment).pipe(
+    Effect.timeoutOption(PI_COMMAND_INVENTORY_TIMEOUT_MS),
+    Effect.result,
+  );
+  const commandInventoryAvailable =
+    Result.isSuccess(commandInventoryResult) && Option.isSome(commandInventoryResult.success);
+  const slashCommands = Result.isSuccess(commandInventoryResult)
+    ? Option.match(commandInventoryResult.success, {
+        onNone: () => [],
+        onSome: piSlashCommandsFromInventory,
+      })
+    : [];
+  const commandInventoryNote = commandInventoryAvailable
+    ? ""
+    : " Slash-command inventory is unavailable.";
+
   return buildServerProvider({
     presentation: PI_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
+    slashCommands,
     probe: {
       installed: true,
       version,
@@ -282,8 +358,8 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
           : { status: "unknown", type: "pi" },
       message:
         models.length > 0
-          ? `${models.length} model${models.length === 1 ? "" : "s"} available through Pi Agent.`
-          : "Pi Agent is ready, but it reported no available models. Configure authentication and models in Pi itself.",
+          ? `${models.length} model${models.length === 1 ? "" : "s"} available through Pi Agent.${commandInventoryNote}`
+          : `Pi Agent is ready, but it reported no available models. Configure authentication and models in Pi itself.${commandInventoryNote}`,
     },
   });
 });
