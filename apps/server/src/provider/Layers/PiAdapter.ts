@@ -1,5 +1,6 @@
 import {
   EventId,
+  type ChatAttachment,
   type ModelSelection,
   type PiSettings,
   type ProviderRuntimeEvent,
@@ -25,6 +26,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
   ProviderAdapterProcessError,
@@ -204,6 +206,46 @@ function finalAssistantText(content: ReadonlyArray<unknown>) {
   }
   return text.join("");
 }
+
+const readPiImageAttachments = Effect.fn("PiAdapter.readPiImageAttachments")(function* (
+  attachments: ReadonlyArray<ChatAttachment>,
+  method: "prompt" | "steer",
+  fileSystem: FileSystem.FileSystem,
+  attachmentsDir: string,
+) {
+  return yield* Effect.forEach(attachments, (attachment) =>
+    Effect.gen(function* () {
+      const attachmentPath = resolveAttachmentPath({
+        attachmentsDir,
+        attachment,
+      });
+      if (!attachmentPath) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method,
+          detail: `Invalid attachment id '${attachment.id}'.`,
+        });
+      }
+
+      const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method,
+              detail: `Failed to read image attachment '${attachment.name}'.`,
+              cause,
+            }),
+        ),
+      );
+      return {
+        type: "image" as const,
+        data: Buffer.from(bytes).toString("base64"),
+        mimeType: attachment.mimeType,
+      };
+    }),
+  );
+});
 
 export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   settings: PiSettings,
@@ -918,19 +960,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
   const sendTurn: PiAdapterShape["sendTurn"] = Effect.fn("PiAdapter.sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
-    const message = input.input?.trim();
-    if (!message) {
+    const message = input.input?.trim() ?? "";
+    if (!message && (input.attachments?.length ?? 0) === 0) {
       return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
         operation: "sendTurn",
-        issue: "A non-empty text prompt is required.",
-      });
-    }
-    if (input.attachments && input.attachments.length > 0) {
-      return yield* new ProviderAdapterValidationError({
-        provider: PROVIDER,
-        operation: "sendTurn",
-        issue: "Pi Agent attachments are not available in this provider version.",
+        issue: "A non-empty text prompt or at least one image attachment is required.",
       });
     }
     if (input.modelSelection) {
@@ -954,21 +989,39 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               issue: "Pi Agent is interrupting the active turn for this thread.",
             });
           }
-          yield* context.rpc.request({ type: "steer", message }).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "steer",
-                  detail: cause.message,
-                  cause,
-                }),
-            ),
+          const images = yield* readPiImageAttachments(
+            input.attachments ?? [],
+            "steer",
+            fileSystem,
+            serverConfig.attachmentsDir,
           );
+          yield* context.rpc
+            .request({
+              type: "steer",
+              message,
+              ...(images.length > 0 ? { images } : {}),
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "steer",
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+            );
           const resumeCursor = yield* refreshNativeCursor(context);
           return { threadId: input.threadId, turnId: activeTurn.id, resumeCursor };
         }
 
+        const images = yield* readPiImageAttachments(
+          input.attachments ?? [],
+          "prompt",
+          fileSystem,
+          serverConfig.attachmentsDir,
+        );
         const turnId = TurnId.make(`pi-turn-${yield* randomId}`);
         const turn: PiActiveTurn = {
           id: turnId,
@@ -987,18 +1040,24 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           payload: context.session.model ? { model: context.session.model } : {},
         });
 
-        const promptExit = yield* context.rpc.request({ type: "prompt", message }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "prompt",
-                detail: cause.message,
-                cause,
-              }),
-          ),
-          Effect.exit,
-        );
+        const promptExit = yield* context.rpc
+          .request({
+            type: "prompt",
+            message,
+            ...(images.length > 0 ? { images } : {}),
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "prompt",
+                  detail: cause.message,
+                  cause,
+                }),
+            ),
+            Effect.exit,
+          );
         if (Exit.isFailure(promptExit)) {
           yield* finalizeTurn(context, turn, {
             state: "failed",
