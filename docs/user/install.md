@@ -70,7 +70,9 @@ that turn, and stopping it interrupts the native Pi turn without ending the sess
 attachments are sent to multimodal Pi models in both new messages and steering messages.
 Interactive Pi extensions surface their select, confirm, input, and editor dialogs through T3
 Code's structured input prompts, and their warning and error notifications appear in the thread.
-Pi does not expose T3 Code's permission or plan-mode controls.
+Pi can also generate thread titles and source-control text (commit messages, branch names, and
+pull-request content) in isolated, tool-disabled sessions that never touch the active chat
+conversation. Pi does not expose T3 Code's permission or plan-mode controls.
 
 ### Binary Discovery
 

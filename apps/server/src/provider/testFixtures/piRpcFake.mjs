@@ -13,7 +13,21 @@ if (process.argv.includes("--version")) {
 
 const noSession = process.argv.includes("--no-session");
 const sessionArgIndex = process.argv.indexOf("--session");
+const sessionDirArgIndex = process.argv.indexOf("--session-dir");
+const sessionIdArgIndex = process.argv.indexOf("--session-id");
 const requestedSessionFile = sessionArgIndex === -1 ? undefined : process.argv[sessionArgIndex + 1];
+const requestedSessionDir =
+  sessionDirArgIndex === -1 ? undefined : process.argv[sessionDirArgIndex + 1];
+const requestedSessionId =
+  sessionIdArgIndex === -1 ? undefined : process.argv[sessionIdArgIndex + 1];
+
+if (process.env.PI_FAKE_CAPTURE_ARGS_FILE) {
+  NodeFS.writeFileSync(
+    process.env.PI_FAKE_CAPTURE_ARGS_FILE,
+    JSON.stringify(process.argv.slice(2)),
+    "utf8",
+  );
+}
 const fakeDirectory =
   process.env.PI_FAKE_SESSION_ROOT ??
   NodePath.join(
@@ -76,10 +90,14 @@ if (noSession) {
   sessionFile = NodePath.resolve(requestedSessionFile);
   readSessionFile(sessionFile);
 } else {
-  sessionId = process.env.PI_FAKE_SESSION_ID ?? `fake-session-${String(process.pid)}`;
+  sessionId =
+    requestedSessionId ?? process.env.PI_FAKE_SESSION_ID ?? `fake-session-${String(process.pid)}`;
   sessionFile = NodePath.resolve(
     process.env.PI_FAKE_SESSION_FILE ??
-      NodePath.join(fakeDirectory, "native-sessions", `${sessionId}.jsonl`),
+      NodePath.join(
+        requestedSessionDir ?? NodePath.join(fakeDirectory, "native-sessions"),
+        `${sessionId}.jsonl`,
+      ),
   );
   NodeFS.mkdirSync(NodePath.dirname(sessionFile), { recursive: true });
   NodeFS.writeFileSync(
@@ -97,6 +115,7 @@ if (noSession) {
 let input = "";
 let currentModel = null;
 let currentThinkingLevel = "medium";
+let lastAssistantText = null;
 let promptCount = 0;
 let emitLateAbortEventsOnNextPrompt = false;
 let pendingExtensionRequest = null;
@@ -211,6 +230,9 @@ function handleCommand(command) {
         }
       }
       break;
+    case "get_last_assistant_text":
+      respond(command, { text: lastAssistantText });
+      break;
     case "get_state":
       respond(command, {
         model: currentModel,
@@ -297,12 +319,18 @@ function handleCommand(command) {
         reject(command, "rejected first fake prompt");
         break;
       }
-      const assistantText =
-        process.env.PI_FAKE_SCENARIO === "basic-turn"
+      const isTextGeneration =
+        process.env.PI_FAKE_TEXT_GENERATION_OUTPUT !== undefined ||
+        process.env.PI_FAKE_TEXT_GENERATION_EMPTY === "1" ||
+        process.env.PI_FAKE_TEXT_GENERATION_STOP_REASON !== undefined;
+      const assistantText = isTextGeneration
+        ? (process.env.PI_FAKE_TEXT_GENERATION_OUTPUT ?? "")
+        : process.env.PI_FAKE_SCENARIO === "basic-turn"
           ? `fake:${command.message ?? ""}:${process.cwd()}:${process.env.PI_FAKE_MARKER ?? ""}:${process.argv.slice(2).join(",")}`
           : process.env.PI_FAKE_SCENARIO === "model-selection"
             ? `selection:${currentModel?.provider ?? "none"}/${currentModel?.id ?? "none"}:${currentThinkingLevel}:${command.message ?? ""}`
             : `fake:${command.message ?? ""}`;
+      lastAssistantText = assistantText;
       respond(command);
       if (process.env.PI_FAKE_CAPTURE_IMAGES === "1") {
         writeJson({
@@ -310,6 +338,50 @@ function handleCommand(command) {
           message: command.message ?? "",
           images: command.images ?? [],
         });
+      }
+      if (isTextGeneration) {
+        if (process.env.PI_FAKE_CAPTURE_STATE_FILE) {
+          NodeFS.writeFileSync(
+            process.env.PI_FAKE_CAPTURE_STATE_FILE,
+            JSON.stringify({
+              currentModel,
+              currentThinkingLevel,
+              sessionFile,
+              message: command.message ?? "",
+              images: command.images ?? [],
+            }),
+            "utf8",
+          );
+        }
+        writeJson({ type: "agent_start" });
+        const stopReason = process.env.PI_FAKE_TEXT_GENERATION_STOP_REASON;
+        writeJson({ type: "message_start", message: { role: "assistant", content: [] } });
+        if (assistantText.length > 0) {
+          writeJson({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "text_delta",
+              contentIndex: 0,
+              delta: assistantText,
+            },
+          });
+        }
+        writeJson({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: assistantText.length > 0 ? [{ type: "text", text: assistantText }] : [],
+            ...(stopReason ? { stopReason } : {}),
+            ...(stopReason === "error"
+              ? {
+                  errorMessage:
+                    process.env.PI_FAKE_TEXT_GENERATION_ERROR ?? "fake text generation error",
+                }
+              : {}),
+          },
+        });
+        writeJson({ type: "agent_settled" });
+        break;
       }
       if (emitLateAbortEventsOnNextPrompt) {
         emitLateAbortEventsOnNextPrompt = false;
