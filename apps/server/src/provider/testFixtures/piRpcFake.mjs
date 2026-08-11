@@ -96,6 +96,7 @@ if (noSession) {
 
 let input = "";
 let currentModel = null;
+let currentThinkingLevel = "medium";
 let promptCount = 0;
 const deferredResponses = [];
 const outputQueue = [];
@@ -178,7 +179,7 @@ function handleCommand(command) {
     case "get_state":
       respond(command, {
         model: currentModel,
-        thinkingLevel: "medium",
+        thinkingLevel: currentThinkingLevel,
         isStreaming: false,
         isCompacting: false,
         steeringMode: "one-at-a-time",
@@ -203,21 +204,57 @@ function handleCommand(command) {
         models:
           process.env.PI_FAKE_MODELS === "empty"
             ? []
-            : [
-                {
-                  provider: "fake",
-                  id: "fake-model",
-                  name: "Fake Model",
-                  api: "fake",
-                  baseUrl: "https://example.invalid",
-                  reasoning: true,
-                  input: ["text", "image"],
-                  contextWindow: 128000,
-                  maxTokens: 8192,
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                },
-              ],
+            : process.env.PI_FAKE_MODELS === "capabilities"
+              ? [
+                  {
+                    provider: "gateway",
+                    id: "org/model/v2",
+                    name: "Shared Model",
+                    reasoning: true,
+                  },
+                  {
+                    provider: "another",
+                    id: "org/model/v2",
+                    name: "Shared Model",
+                    reasoning: true,
+                  },
+                  {
+                    provider: "plain",
+                    id: "text-only",
+                    name: "Text Only",
+                    reasoning: false,
+                  },
+                ]
+              : [
+                  {
+                    provider: "fake",
+                    id: "fake-model",
+                    name: "Fake Model",
+                    api: "fake",
+                    baseUrl: "https://example.invalid",
+                    reasoning: true,
+                    input: ["text", "image"],
+                    contextWindow: 128000,
+                    maxTokens: 8192,
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  },
+                ],
       });
+      break;
+    case "get_available_thinking_levels": {
+      const modelSlug = currentModel ? `${currentModel.provider}/${currentModel.id}` : "";
+      const levels =
+        modelSlug === "gateway/org/model/v2"
+          ? ["off", "high", "max"]
+          : modelSlug === "another/org/model/v2"
+            ? ["minimal", "medium", "xhigh"]
+            : ["off", "minimal", "low", "medium", "high"];
+      respond(command, { levels });
+      break;
+    }
+    case "set_thinking_level":
+      currentThinkingLevel = String(command.level ?? "off");
+      respond(command);
       break;
     case "prompt": {
       promptCount += 1;
@@ -228,7 +265,9 @@ function handleCommand(command) {
       const assistantText =
         process.env.PI_FAKE_SCENARIO === "basic-turn"
           ? `fake:${command.message ?? ""}:${process.cwd()}:${process.env.PI_FAKE_MARKER ?? ""}:${process.argv.slice(2).join(",")}`
-          : `fake:${command.message ?? ""}`;
+          : process.env.PI_FAKE_SCENARIO === "model-selection"
+            ? `selection:${currentModel?.provider ?? "none"}/${currentModel?.id ?? "none"}:${currentThinkingLevel}:${command.message ?? ""}`
+            : `fake:${command.message ?? ""}`;
       respond(command);
       writeJson({ type: "agent_start" });
       if (process.env.PI_FAKE_WAIT_FOR_ABORT === "1") break;

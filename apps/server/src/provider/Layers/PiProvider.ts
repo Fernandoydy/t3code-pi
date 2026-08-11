@@ -10,6 +10,11 @@ import * as Schema from "effect/Schema";
 import { ChildProcess } from "effect/unstable/process";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
+import {
+  PI_THINKING_LEVEL_OPTION_ID,
+  PiThinkingLevel,
+  piThinkingLevelLabel,
+} from "../pi/PiModel.ts";
 import { makePiRpcProcess } from "../pi/PiRpcProcess.ts";
 import {
   buildServerProvider,
@@ -28,23 +33,49 @@ const PI_PRESENTATION = {
   showRuntimeModeToggle: false,
 } as const;
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+const PiThinkingLevels = Schema.Struct({ levels: Schema.Array(PiThinkingLevel) });
+const decodePiThinkingLevels = Schema.decodeUnknownEffect(PiThinkingLevels);
 
 const PiInventoryModel = Schema.Struct({
   provider: Schema.String,
   id: Schema.String,
   name: Schema.optional(Schema.String),
+  reasoning: Schema.optional(Schema.Boolean),
 });
 const PiInventory = Schema.Struct({ models: Schema.Array(PiInventoryModel) });
 const decodePiInventory = Schema.decodeUnknownEffect(PiInventory);
+const PiModelInventory = Schema.Array(
+  Schema.Struct({
+    model: PiInventoryModel,
+    thinkingLevels: Schema.Array(PiThinkingLevel),
+  }),
+);
 
 function configuredPiCommand(settings: PiSettings) {
   return settings.binaryPath || "pi";
 }
 
-function piModelsFromInventory(inventory: typeof PiInventory.Type) {
+function piModelCapabilities(thinkingLevels: ReadonlyArray<typeof PiThinkingLevel.Type>) {
+  if (thinkingLevels.length === 0) return EMPTY_MODEL_CAPABILITIES;
+  return createModelCapabilities({
+    optionDescriptors: [
+      {
+        id: PI_THINKING_LEVEL_OPTION_ID,
+        label: "Thinking",
+        type: "select",
+        options: thinkingLevels.map((level) => ({
+          id: level,
+          label: piThinkingLevelLabel(level),
+        })),
+      },
+    ],
+  });
+}
+
+function piModelsFromInventory(inventory: typeof PiModelInventory.Type) {
   const seen = new Set<string>();
   const models: Array<ServerProviderModel> = [];
-  for (const nativeModel of inventory.models) {
+  for (const { model: nativeModel, thinkingLevels } of inventory) {
     const provider = nativeModel.provider.trim();
     const modelId = nativeModel.id.trim();
     if (!provider || !modelId) continue;
@@ -56,7 +87,7 @@ function piModelsFromInventory(inventory: typeof PiInventory.Type) {
       name: nativeModel.name?.trim() || modelId,
       subProvider: provider,
       isCustom: false,
-      capabilities: EMPTY_MODEL_CAPABILITIES,
+      capabilities: piModelCapabilities(thinkingLevels),
     });
   }
   return models.toSorted((left, right) => left.name.localeCompare(right.name));
@@ -88,8 +119,29 @@ const loadPiInventory = (settings: PiSettings, cwd: string, environment: NodeJS.
         cwd,
         environment,
       });
+      const loadModelThinkingLevels = Effect.fn("PiProvider.loadModelThinkingLevels")(function* (
+        model: typeof PiInventoryModel.Type,
+      ) {
+        // Pi reports only "off" here; omit a one-choice control for non-reasoning models.
+        if (model.reasoning !== true) {
+          return { model, thinkingLevels: [] };
+        }
+        yield* rpc.request({
+          type: "set_model",
+          provider: model.provider,
+          modelId: model.id,
+        });
+        const levelsResponse = yield* rpc.request({
+          type: "get_available_thinking_levels",
+        });
+        const { levels } = yield* decodePiThinkingLevels(levelsResponse.data);
+        return { model, thinkingLevels: levels };
+      });
       const response = yield* rpc.request({ type: "get_available_models" });
-      return yield* decodePiInventory(response.data);
+      const inventory = yield* decodePiInventory(response.data);
+      return yield* Effect.forEach(inventory.models, loadModelThinkingLevels, {
+        concurrency: 1,
+      });
     }),
   );
 

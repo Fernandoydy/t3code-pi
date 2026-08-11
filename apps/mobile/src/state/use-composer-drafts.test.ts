@@ -119,6 +119,33 @@ describe("mobile composer drafts", () => {
     });
   });
 
+  it("preserves Pi model IDs and thinking levels when sent content is cleared", () => {
+    const draftKey = "environment-1:thread-pi";
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("pi_work"),
+      model: "gateway/org/model/v2",
+      options: [{ id: "thinkingLevel", value: "max" }],
+    };
+    const persisted = decodePersistedComposerDrafts({
+      schemaVersion: 1,
+      drafts: {
+        [draftKey]: {
+          text: "send this",
+          attachments: [],
+          modelSelection,
+        },
+      },
+    });
+
+    expect(clearComposerDraftContentState(persisted, draftKey)).toEqual({
+      [draftKey]: {
+        text: "",
+        attachments: [],
+        modelSelection,
+      },
+    });
+  });
+
   it("drops the workspace selection when clearing a sent new-task draft", () => {
     const draftKey = "new-task:environment-1:project-1";
     const draft: ComposerDraft = {
