@@ -10,6 +10,10 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import { HttpClient } from "effect/unstable/http";
 import {
+  PI_NPM_PACKAGE_NAME,
+  resolvePiProviderMaintenanceCapabilities,
+} from "./Drivers/PiDriver.ts";
+import {
   createProviderVersionAdvisory,
   enrichProviderSnapshotWithVersionAdvisory,
   makePackageManagedProviderMaintenanceResolver,
@@ -179,6 +183,85 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       updateCommand: "npm install -g @example/native-package-tool@latest",
       canUpdate: true,
       message: "Install the update now or review provider settings.",
+    });
+  });
+
+  it.effect("resolves Pi's latest version from the official npm advisory cache", () => {
+    const piProvider: ServerProvider = {
+      ...installedPackageToolProvider,
+      instanceId: ProviderInstanceId.make("piAgent"),
+      driver: driver("piAgent"),
+      version: "0.84.1",
+    };
+    return enrichProviderSnapshotWithVersionAdvisory(
+      piProvider,
+      resolvePiProviderMaintenanceCapabilities({
+        binaryPath: "/home/test/.local/bin/pi",
+        resolvedCommandPath: "/home/test/.local/bin/pi",
+      }),
+      { enableProviderUpdateChecks: true },
+    ).pipe(
+      Effect.provideService(
+        ProviderVersionCache,
+        new Map([[PI_NPM_PACKAGE_NAME, { expiresAt: Number.MAX_SAFE_INTEGER, version: "0.84.2" }]]),
+      ),
+      Effect.provideService(
+        HttpClient.HttpClient,
+        HttpClient.make(() => Effect.die("cached Pi version should not make an HTTP request")),
+      ),
+      Effect.map((provider) => {
+        expect(provider.versionAdvisory).toMatchObject({
+          status: "behind_latest",
+          currentVersion: "0.84.1",
+          latestVersion: "0.84.2",
+          updateCommand: "pi update --self",
+          canUpdate: true,
+        });
+      }),
+    );
+  });
+
+  it("uses Pi's native self-update only for recognized installations", () => {
+    // The default bare command delegates safety to Pi's own updater, which
+    // refuses (with manual instructions) when it cannot manage the install.
+    const defaultCommand = resolvePiProviderMaintenanceCapabilities({
+      binaryPath: "pi",
+      resolvedCommandPath: "/opt/custom/pi",
+      realCommandPath: "/opt/custom/pi",
+    });
+    const native = resolvePiProviderMaintenanceCapabilities({
+      binaryPath: "/home/test/.local/bin/pi",
+      resolvedCommandPath: "/home/test/.local/bin/pi",
+    });
+    const custom = resolvePiProviderMaintenanceCapabilities({
+      binaryPath: "/opt/custom/pi",
+      resolvedCommandPath: "/opt/custom/pi",
+    });
+
+    expect(defaultCommand).toMatchObject({
+      provider: driver("piAgent"),
+      packageName: "@earendil-works/pi-coding-agent",
+      update: {
+        command: "pi update --self",
+        executable: "pi",
+        args: ["update", "--self"],
+        lockKey: "pi-native",
+      },
+    });
+    expect(native).toMatchObject({
+      provider: driver("piAgent"),
+      packageName: "@earendil-works/pi-coding-agent",
+      update: {
+        command: "pi update --self",
+        executable: "pi",
+        args: ["update", "--self"],
+        lockKey: "pi-native",
+      },
+    });
+    expect(custom).toMatchObject({
+      provider: driver("piAgent"),
+      packageName: "@earendil-works/pi-coding-agent",
+      update: null,
     });
   });
 

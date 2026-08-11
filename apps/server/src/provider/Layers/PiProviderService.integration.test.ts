@@ -18,6 +18,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { FetchHttpClient } from "effect/unstable/http";
 import { describe, expect } from "vite-plus/test";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
@@ -27,6 +28,8 @@ import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { PiDriver } from "../Drivers/PiDriver.ts";
+import { PI_NPM_PACKAGE_NAME } from "../Drivers/PiDriver.ts";
+import { ProviderVersionCache } from "../providerMaintenance.ts";
 import { ProviderAdapterRegistryLive } from "./ProviderAdapterRegistry.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryLayer } from "./ProviderInstanceRegistryLive.ts";
@@ -188,8 +191,15 @@ function makeTestLayer(
     prefix: "pi-provider-service-test-",
   }).pipe(
     Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(FetchHttpClient.layer),
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(settingsLayer),
+    Layer.provideMerge(
+      Layer.succeed(
+        ProviderVersionCache,
+        new Map([[PI_NPM_PACKAGE_NAME, { expiresAt: Number.MAX_SAFE_INTEGER, version: "0.84.1" }]]),
+      ),
+    ),
     Layer.provideMerge(Layer.succeed(ProviderEventLoggers, eventLoggers)),
   );
   const instanceRegistry = ProviderInstanceRegistryLayer({

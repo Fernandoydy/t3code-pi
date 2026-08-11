@@ -32,9 +32,11 @@ const isServerProviderUpdateError = Schema.is(ServerProviderUpdateError);
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
+const PI_DRIVER = ProviderDriverKind.make("piAgent");
 const CODEX_INSTANCE_ID = ProviderInstanceId.make("codex");
 const CURSOR_INSTANCE_ID = ProviderInstanceId.make("cursor");
 const OPENCODE_INSTANCE_ID = ProviderInstanceId.make("opencode");
+const PI_INSTANCE_ID = ProviderInstanceId.make("piAgent");
 const encoder = new TextEncoder();
 
 // Pin a non-win32 platform so `resolveSpawnCommand` is a no-op and the raw
@@ -51,6 +53,15 @@ function lifecycleFor(provider: ProviderDriverKind): ProviderMaintenanceCapabili
       updateExecutable: "cursor-agent",
       updateArgs: ["update"],
       updateLockKey: "cursor-agent",
+    });
+  }
+  if (provider === PI_DRIVER) {
+    return makeProviderMaintenanceCapabilities({
+      provider,
+      packageName: "@earendil-works/pi-coding-agent",
+      updateExecutable: "pi",
+      updateArgs: ["update", "--self"],
+      updateLockKey: "pi-native",
     });
   }
   return makeProviderMaintenanceCapabilities({
@@ -89,6 +100,12 @@ const baseOpenCodeProvider: ServerProvider = {
   ...baseProvider,
   instanceId: OPENCODE_INSTANCE_ID,
   driver: OPENCODE_DRIVER,
+};
+
+const basePiProvider: ServerProvider = {
+  ...baseProvider,
+  instanceId: PI_INSTANCE_ID,
+  driver: PI_DRIVER,
 };
 
 const latestVersionHttpClient = (version: string) =>
@@ -217,6 +234,35 @@ const makeTestRunner = (registry: ProviderRegistryShape) =>
   );
 
 describe("providerMaintenanceRunner", () => {
+  it.effect("runs Pi's native self-update without updating Pi resources", () => {
+    const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
+    return Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(basePiProvider);
+      const updater = yield* makeTestRunner(registry);
+
+      const result = yield* updater.updateProvider(PI_DRIVER);
+
+      assert.deepStrictEqual(calls, [
+        {
+          command: "pi",
+          args: ["update", "--self"],
+        },
+      ]);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NonWindowsPlatform,
+          latestVersionHttpClient("0.84.1"),
+          mockSpawnerLayer((command, args) => {
+            calls.push({ command, args });
+            return { stdout: "Pi updated" };
+          }),
+        ),
+      ),
+    );
+  });
+
   it.effect("runs the allowlisted provider update command and records success", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     return Effect.gen(function* () {
