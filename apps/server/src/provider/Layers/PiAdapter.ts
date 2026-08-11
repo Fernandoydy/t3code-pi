@@ -13,9 +13,11 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -33,8 +35,17 @@ import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("piAgent");
+const PI_RESUME_SCHEMA_VERSION = 1;
 
-const PiState = Schema.Struct({ sessionId: Schema.String });
+export const PiResumeCursor = Schema.Struct({
+  schemaVersion: Schema.Literal(PI_RESUME_SCHEMA_VERSION),
+  sessionFile: Schema.String,
+  sessionId: Schema.String,
+});
+type PiResumeCursor = typeof PiResumeCursor.Type;
+const decodePiResumeCursor = Schema.decodeUnknownEffect(PiResumeCursor);
+
+const PiState = Schema.Struct({ sessionFile: Schema.String, sessionId: Schema.String });
 const decodePiState = Schema.decodeUnknownEffect(PiState);
 
 const PiAssistantDelta = Schema.Union([
@@ -95,6 +106,31 @@ const PiMessageContent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("thinking"), thinking: Schema.String }),
 ]);
 const decodePiMessageContent = Schema.decodeUnknownOption(PiMessageContent);
+const PiSnapshotMessage = Schema.StructWithRest(Schema.Struct({ role: Schema.String }), [
+  Schema.Record(Schema.String, Schema.Unknown),
+]);
+const PiSnapshotEntryFields = {
+  id: Schema.String,
+  parentId: Schema.NullOr(Schema.String),
+};
+const PiSnapshotEntry = Schema.StructWithRest(Schema.Struct(PiSnapshotEntryFields), [
+  Schema.Record(Schema.String, Schema.Unknown),
+]);
+const PiSnapshotMessageEntry = Schema.StructWithRest(
+  Schema.Struct({
+    ...PiSnapshotEntryFields,
+    type: Schema.Literal("message"),
+    message: PiSnapshotMessage,
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+);
+const decodePiSnapshotEntry = Schema.decodeUnknownOption(PiSnapshotEntry);
+const decodePiSnapshotMessageEntry = Schema.decodeUnknownOption(PiSnapshotMessageEntry);
+const PiEntriesResponse = Schema.Struct({
+  entries: Schema.Array(Schema.Unknown),
+  leafId: Schema.NullOr(Schema.String),
+});
+const decodePiEntriesResponse = Schema.decodeUnknownEffect(PiEntriesResponse);
 
 export interface PiAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
@@ -107,13 +143,12 @@ interface PiSessionContext {
   session: ProviderSession;
   readonly rpc: Effect.Success<ReturnType<typeof makePiRpcProcess>>;
   readonly scope: Scope.Closeable;
-  readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   activeTurnId: TurnId | undefined;
   activeAssistantItemId: string | undefined;
   assistantMessageSequence: number;
   terminalState: "completed" | "failed" | "interrupted";
   terminalError: string | undefined;
-  stopped: boolean;
+  readonly stopped: Ref.Ref<boolean>;
 }
 
 function parsePiModelSlug(slug: string) {
@@ -160,6 +195,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
   const instanceId = options?.instanceId ?? ProviderInstanceId.make("piAgent");
   const owningScope = yield* Scope.Scope;
   const serverConfig = yield* ServerConfig;
+  const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const crypto = yield* Crypto.Crypto;
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -228,10 +264,89 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
 
   const requireSession = Effect.fn("PiAdapter.requireSession")(function* (threadId: ThreadId) {
     const context = sessions.get(threadId);
-    if (!context || context.stopped) {
+    if (!context || (yield* Ref.get(context.stopped))) {
       return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId });
     }
     return context;
+  });
+
+  const decodeResumeCursor = Effect.fn("PiAdapter.decodeResumeCursor")(function* (
+    resumeCursor: unknown,
+  ) {
+    const cursor = yield* decodePiResumeCursor(resumeCursor).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Pi Agent resume state is invalid or uses an unsupported schema version.",
+            cause,
+          }),
+      ),
+    );
+    if (!cursor.sessionId.trim() || !path.isAbsolute(cursor.sessionFile)) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "startSession",
+        issue: "Pi Agent resume state requires a native session ID and absolute session file.",
+      });
+    }
+    return { ...cursor, sessionFile: path.resolve(cursor.sessionFile) };
+  });
+
+  const readNativeCursor = Effect.fn("PiAdapter.readNativeCursor")(function* (
+    rpc: PiSessionContext["rpc"],
+    method: string,
+  ) {
+    const stateResponse = yield* rpc.request({ type: "get_state" }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method,
+            detail: cause.message,
+            cause,
+          }),
+      ),
+    );
+    const state = yield* decodePiState(stateResponse.data).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method,
+            detail: "Pi Agent returned an invalid persistent session state.",
+            cause,
+          }),
+      ),
+    );
+    if (!state.sessionId.trim() || !path.isAbsolute(state.sessionFile)) {
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method,
+        detail: "Pi Agent did not report an absolute native session file and session ID.",
+      });
+    }
+    return {
+      schemaVersion: PI_RESUME_SCHEMA_VERSION,
+      sessionFile: path.resolve(state.sessionFile),
+      sessionId: state.sessionId,
+    } satisfies PiResumeCursor;
+  });
+
+  const verifyNativeCursor = Effect.fn("PiAdapter.verifyNativeCursor")(function* (
+    expected: PiResumeCursor,
+    actual: PiResumeCursor,
+    method: string,
+  ) {
+    if (expected.sessionFile !== actual.sessionFile || expected.sessionId !== actual.sessionId) {
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method,
+        detail: "Pi Agent opened a different native session than the recorded resume state.",
+      });
+    }
+    return actual;
   });
 
   const updateSession = Effect.fn("PiAdapter.updateSession")(function* (
@@ -248,13 +363,21 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context.session = next;
   });
 
+  const claimContextStop = Effect.fn("PiAdapter.claimContextStop")(function* (
+    context: PiSessionContext,
+  ) {
+    if (yield* Ref.getAndSet(context.stopped, true)) return false;
+    if (sessions.get(context.session.threadId) === context) {
+      sessions.delete(context.session.threadId);
+    }
+    return true;
+  });
+
   const stopContext = Effect.fn("PiAdapter.stopContext")(function* (
     context: PiSessionContext,
     emitExit = true,
   ) {
-    if (context.stopped) return;
-    context.stopped = true;
-    sessions.delete(context.session.threadId);
+    if (!(yield* claimContextStop(context))) return;
     yield* Scope.close(context.scope, Exit.void).pipe(Effect.ignore);
     if (emitExit) {
       yield* publish({
@@ -269,10 +392,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context: PiSessionContext,
     cause: unknown,
   ) {
-    if (context.stopped) return;
+    if (!(yield* claimContextStop(context))) return;
     const turnId = context.activeTurnId;
-    context.stopped = true;
-    sessions.delete(context.session.threadId);
     const message = cause instanceof Error ? cause.message : "Pi Agent RPC process failed.";
     if (turnId) {
       yield* publish({
@@ -409,7 +530,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       }
       case "tool_execution_end": {
         if (!turnId) return;
-        context.turns.find((turn) => turn.id === turnId)?.items.push(event);
         yield* publish({
           ...(yield* makeEventBase({
             threadId: context.session.threadId,
@@ -522,6 +642,31 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
           issue: "Pi Agent model selection must use the 'provider/model' format.",
         });
       }
+      const resumeCursor =
+        input.resumeCursor === undefined
+          ? undefined
+          : yield* decodeResumeCursor(input.resumeCursor);
+      if (resumeCursor) {
+        const exists = yield* fileSystem.exists(resumeCursor.sessionFile).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/resume",
+                detail: `Failed to inspect recorded native session '${resumeCursor.sessionFile}'.`,
+                cause,
+              }),
+          ),
+        );
+        if (!exists) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/resume",
+            detail: `Recorded native session does not exist: ${resumeCursor.sessionFile}`,
+          });
+        }
+      }
+
       const existing = sessions.get(input.threadId);
       if (existing) yield* stopContext(existing, false);
 
@@ -532,7 +677,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       );
       const rpcExit = yield* makePiRpcProcess({
         command: settings.binaryPath || "pi",
-        args: ["--mode", "rpc"],
+        args: ["--mode", "rpc", ...(resumeCursor ? ["--session", resumeCursor.sessionFile] : [])],
         cwd,
         ...(options?.environment ? { environment: options.environment } : {}),
       }).pipe(
@@ -545,12 +690,18 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         return yield* new ProviderAdapterProcessError({
           provider: PROVIDER,
           threadId: input.threadId,
-          detail: "Failed to start the Pi Agent RPC process.",
+          detail: resumeCursor
+            ? "Failed to resume the recorded Pi Agent native session."
+            : "Failed to start the Pi Agent RPC process.",
           cause: rpcExit.cause,
         });
       }
       const rpc = rpcExit.value;
       const configuredExit = yield* Effect.gen(function* () {
+        const observedCursor = yield* readNativeCursor(rpc, "get_state");
+        const currentCursor = resumeCursor
+          ? yield* verifyNativeCursor(resumeCursor, observedCursor, "session/resume")
+          : observedCursor;
         if (nativeModel) {
           yield* rpc
             .request({
@@ -570,34 +721,21 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
               ),
             );
         }
-        const stateResponse = yield* rpc.request({ type: "get_state" }).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "get_state",
-                detail: cause.message,
-                cause,
-              }),
-          ),
-        );
-        return yield* decodePiState(stateResponse.data).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "get_state",
-                detail: "Pi Agent returned an invalid session state.",
-                cause,
-              }),
-          ),
-        );
+        return currentCursor;
       }).pipe(Effect.exit);
       if (Exit.isFailure(configuredExit)) {
         yield* Scope.close(sessionScope, Exit.void).pipe(Effect.ignore);
+        if (resumeCursor) {
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+            detail: "Failed to resume the recorded Pi Agent native session.",
+            cause: configuredExit.cause,
+          });
+        }
         return yield* Effect.failCause(configuredExit.cause);
       }
-      const state = configuredExit.value;
+      const currentCursor = configuredExit.value;
       const now = yield* nowIso;
       const session: ProviderSession = {
         provider: PROVIDER,
@@ -607,6 +745,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         cwd,
         ...(selection ? { model: selection.model } : {}),
         threadId: input.threadId,
+        resumeCursor: currentCursor,
         createdAt: now,
         updatedAt: now,
       };
@@ -614,13 +753,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
         session,
         rpc,
         scope: sessionScope,
-        turns: [],
         activeTurnId: undefined,
         activeAssistantItemId: undefined,
         assistantMessageSequence: 0,
         terminalState: "completed",
         terminalError: undefined,
-        stopped: false,
+        stopped: yield* Ref.make(false),
       };
       sessions.set(input.threadId, context);
       yield* startEventPump(context);
@@ -632,7 +770,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       yield* publish({
         ...(yield* makeEventBase({ threadId: input.threadId })),
         type: "thread.started",
-        payload: { providerThreadId: state.sessionId },
+        payload: { providerThreadId: currentCursor.sessionId },
       });
       return session;
     },
@@ -679,7 +817,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     context.assistantMessageSequence = 0;
     context.terminalState = "completed";
     context.terminalError = undefined;
-    context.turns.push({ id: turnId, items: [] });
     yield* updateSession(context, { status: "running", activeTurnId: turnId });
     yield* publish({
       ...(yield* makeEventBase({ threadId: input.threadId, turnId })),
@@ -719,7 +856,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
       });
       return yield* Effect.failCause(cause);
     }
-    return { threadId: input.threadId, turnId };
+    const previousCursor = yield* decodeResumeCursor(context.session.resumeCursor);
+    const refreshedCursor = yield* readNativeCursor(context.rpc, "get_state").pipe(
+      Effect.flatMap((currentCursor) =>
+        verifyNativeCursor(previousCursor, currentCursor, "session/state"),
+      ),
+    );
+    yield* updateSession(context, { resumeCursor: refreshedCursor });
+    return { threadId: input.threadId, turnId, resumeCursor: refreshedCursor };
   });
 
   const interruptTurn: PiAdapterShape["interruptTurn"] = Effect.fn("PiAdapter.interruptTurn")(
@@ -741,6 +885,111 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     },
   );
 
+  const readThread: PiAdapterShape["readThread"] = Effect.fn("PiAdapter.readThread")(
+    function* (threadId) {
+      const context = yield* requireSession(threadId);
+      const response = yield* context.rpc.request({ type: "get_entries" }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "get_entries",
+              detail: cause.message,
+              cause,
+            }),
+        ),
+      );
+      const data = yield* decodePiEntriesResponse(response.data).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "get_entries",
+              detail: "Pi Agent returned invalid native session entries.",
+              cause,
+            }),
+        ),
+      );
+      const entriesById = new Map(
+        data.entries.flatMap((rawEntry) => {
+          const entry = Option.getOrUndefined(decodePiSnapshotEntry(rawEntry));
+          return entry ? [[entry.id, { entry, rawEntry }] as const] : [];
+        }),
+      );
+      const activeEntries: Array<unknown> = [];
+      const visited = new Set<string>();
+      let currentEntryId = data.leafId;
+      while (currentEntryId !== null && !visited.has(currentEntryId)) {
+        visited.add(currentEntryId);
+        const current = entriesById.get(currentEntryId);
+        if (!current) break;
+        activeEntries.push(current.rawEntry);
+        currentEntryId = current.entry.parentId;
+      }
+      activeEntries.reverse();
+
+      const turns: Array<{ id: TurnId; items: Array<unknown> }> = [];
+      let activeTurn: (typeof turns)[number] | undefined;
+      for (const rawEntry of activeEntries) {
+        const entry = Option.getOrUndefined(decodePiSnapshotMessageEntry(rawEntry));
+        if (!entry) continue;
+        if (entry.message.role === "user") {
+          activeTurn = { id: TurnId.make(entry.id), items: [] };
+          turns.push(activeTurn);
+          continue;
+        }
+        if (!activeTurn) {
+          activeTurn = { id: TurnId.make(entry.id), items: [] };
+          turns.push(activeTurn);
+        }
+        activeTurn.items.push(entry.message);
+      }
+      return { threadId, turns: turns.filter((turn) => turn.items.length > 0) };
+    },
+  );
+
+  const rollbackThread: PiAdapterShape["rollbackThread"] = Effect.fn("PiAdapter.rollbackThread")(
+    function* (threadId, numTurns) {
+      yield* requireSession(threadId);
+      if (!Number.isInteger(numTurns) || numTurns < 1) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "numTurns must be an integer >= 1.",
+        });
+      }
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "thread/rollback",
+        detail: "Pi Agent sessions do not support provider-side rollback.",
+      });
+    },
+  );
+
+  const stopSession: PiAdapterShape["stopSession"] = Effect.fn("PiAdapter.stopSession")(
+    function* (threadId) {
+      const context = sessions.get(threadId);
+      if (!context) return;
+      yield* stopContext(context);
+    },
+  );
+
+  const hasSession: PiAdapterShape["hasSession"] = Effect.fn("PiAdapter.hasSession")(
+    function* (threadId) {
+      const context = sessions.get(threadId);
+      return context !== undefined && !(yield* Ref.get(context.stopped));
+    },
+  );
+
+  const stopAll: PiAdapterShape["stopAll"] = Effect.fn("PiAdapter.stopAll")(function* () {
+    const active = [...sessions.values()];
+    sessions.clear();
+    yield* Effect.forEach(active, (context) => stopContext(context), {
+      concurrency: "unbounded",
+      discard: true,
+    });
+  });
+
   const unsupportedRequest = (operation: string) =>
     Effect.fail(
       new ProviderAdapterValidationError({
@@ -759,17 +1008,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (
     respondToRequest: (_threadId, _requestId, _decision) => unsupportedRequest("respondToRequest"),
     respondToUserInput: (_threadId, _requestId, _answers) =>
       unsupportedRequest("respondToUserInput"),
-    stopSession: (threadId) => requireSession(threadId).pipe(Effect.flatMap(stopContext)),
+    stopSession,
     listSessions: () => Effect.succeed([...sessions.values()].map((context) => context.session)),
-    hasSession: (threadId) => Effect.succeed(sessions.has(threadId)),
-    readThread: (threadId) =>
-      requireSession(threadId).pipe(Effect.map((context) => ({ threadId, turns: context.turns }))),
-    rollbackThread: (_threadId, _numTurns) => unsupportedRequest("rollbackThread"),
-    stopAll: () =>
-      Effect.forEach([...sessions.values()], (context) => stopContext(context), {
-        concurrency: "unbounded",
-        discard: true,
-      }),
+    hasSession,
+    readThread,
+    rollbackThread,
+    stopAll,
     get streamEvents() {
       return Stream.fromPubSub(runtimeEvents);
     },
