@@ -293,6 +293,13 @@ function handleCommand(command) {
             ? `selection:${currentModel?.provider ?? "none"}/${currentModel?.id ?? "none"}:${currentThinkingLevel}:${command.message ?? ""}`
             : `fake:${command.message ?? ""}`;
       respond(command);
+      if (process.env.PI_FAKE_CAPTURE_IMAGES === "1") {
+        writeJson({
+          type: "test_prompt_received",
+          message: command.message ?? "",
+          images: command.images ?? [],
+        });
+      }
       if (emitLateAbortEventsOnNextPrompt) {
         emitLateAbortEventsOnNextPrompt = false;
         writeLateAbortEvents();
@@ -422,6 +429,13 @@ function handleCommand(command) {
       if (process.env.PI_FAKE_REJECT_STEER === "1") {
         reject(command, "rejected fake steer");
         break;
+      }
+      if (process.env.PI_FAKE_CAPTURE_IMAGES === "1") {
+        writeJson({
+          type: "test_steer_received",
+          message: command.message ?? "",
+          images: command.images ?? [],
+        });
       }
       const settleBeforeResponse = process.env.PI_FAKE_SETTLE_BEFORE_STEER_RESPONSE === "1";
       if (!settleBeforeResponse) respond(command);

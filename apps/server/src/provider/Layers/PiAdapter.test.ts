@@ -13,7 +13,9 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
+import { attachmentRelativePath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import type { PiAdapterShape } from "../Services/PiAdapter.ts";
 import { makeFakePiExecutable } from "../testUtils/piFakeExecutable.ts";
 import { makePiAdapter, PiResumeCursor } from "./PiAdapter.ts";
@@ -22,6 +24,15 @@ const PROVIDER = ProviderDriverKind.make("piAgent");
 const INSTANCE_ID = ProviderInstanceId.make("pi_test");
 const decodePiSettings = Schema.decodeSync(PiSettings);
 const decodePiResumeCursor = Schema.decodeUnknownEffect(PiResumeCursor);
+const NativeEventLogEntry = Schema.Struct({
+  event: Schema.Struct({
+    payload: Schema.StructWithRest(Schema.Struct({ type: Schema.String }), [
+      Schema.Record(Schema.String, Schema.Unknown),
+    ]),
+  }),
+});
+const decodeNativeEventLogEntry = Schema.decodeUnknownOption(NativeEventLogEntry);
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 function testLayer() {
   return ServerConfig.layerTest(process.cwd(), { prefix: "pi-adapter-test-" }).pipe(
@@ -210,6 +221,250 @@ describe("PiAdapter durable sessions", () => {
       );
     },
   );
+
+  it.effect("encodes multiple image attachments in a new Pi prompt", () => {
+    const fake = makeFakePiExecutable("t3-pi-adapter-images-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const threadId = ThreadId.make("thread-pi-images");
+    const nativeEntries: Array<unknown> = [];
+    const nativeEventLogger = {
+      filePath: "memory://pi-native-events",
+      write: (entry) => Effect.sync(() => nativeEntries.push(entry)),
+      close: () => Effect.void,
+    } satisfies EventNdjsonLogger;
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const attachments = [
+          {
+            type: "image" as const,
+            id: "thread-pi-images-00000000-0000-4000-8000-000000000001",
+            name: "diagram.png",
+            mimeType: "image/png",
+            sizeBytes: 4,
+          },
+          {
+            type: "image" as const,
+            id: "thread-pi-images-00000000-0000-4000-8000-000000000002",
+            name: "photo.jpg",
+            mimeType: "image/jpeg",
+            sizeBytes: 3,
+          },
+        ] as const;
+        for (const [attachment, bytes] of [
+          [attachments[0], Uint8Array.from([0, 1, 2, 3])],
+          [attachments[1], Uint8Array.from([250, 251, 252])],
+        ] as const) {
+          NodeFS.writeFileSync(
+            NodePath.join(attachmentsDir, attachmentRelativePath(attachment)),
+            bytes,
+          );
+        }
+
+        const adapter = yield* makePiAdapter(settings, {
+          instanceId: INSTANCE_ID,
+          environment: { ...process.env, PI_FAKE_CAPTURE_IMAGES: "1" },
+          nativeEventLogger,
+        });
+        yield* adapter.startSession(startInput(threadId));
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil(
+            (event) => event.type === "turn.completed" || event.type === "turn.aborted",
+          ),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "What do these images show?",
+          attachments,
+        });
+        const runtimeEvents = Array.from(yield* Fiber.join(eventsFiber));
+
+        const prompt = nativeEntries
+          .map((entry) => Option.getOrUndefined(decodeNativeEventLogEntry(entry)))
+          .flatMap((entry) => (entry ? [entry.event.payload] : []))
+          .find((payload) => payload.type === "test_prompt_received");
+        expect(prompt).toMatchObject({
+          type: "test_prompt_received",
+          message: "What do these images show?",
+        });
+        expect(prompt?.images).toEqual([
+          { type: "image", data: "AAECAw==", mimeType: "image/png" },
+          { type: "image", data: "+vv8", mimeType: "image/jpeg" },
+        ]);
+        expect(encodeUnknownJson(runtimeEvents)).not.toContain("AAECAw==");
+        expect(encodeUnknownJson(runtimeEvents)).not.toContain("+vv8");
+        expect(turn.turnId).toBeTruthy();
+
+        const imageOnlyEventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil(
+            (event) => event.type === "turn.completed" || event.type === "turn.aborted",
+          ),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const imageOnlyTurn = yield* adapter.sendTurn({ threadId, attachments });
+        const imageOnlyEvents = Array.from(yield* Fiber.join(imageOnlyEventsFiber));
+        const imageOnlyPrompt = nativeEntries
+          .map((entry) => Option.getOrUndefined(decodeNativeEventLogEntry(entry)))
+          .flatMap((entry) => (entry ? [entry.event.payload] : []))
+          .find((payload) => payload.type === "test_prompt_received" && payload.message === "");
+        expect(imageOnlyPrompt?.images).toEqual([
+          { type: "image", data: "AAECAw==", mimeType: "image/png" },
+          { type: "image", data: "+vv8", mimeType: "image/jpeg" },
+        ]);
+        expect(encodeUnknownJson(imageOnlyEvents)).not.toContain("AAECAw==");
+        expect(encodeUnknownJson(imageOnlyEvents)).not.toContain("+vv8");
+        expect(imageOnlyTurn.turnId).not.toBe(turn.turnId);
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("encodes image attachments when steering an active Pi turn", () => {
+    const fake = makeFakePiExecutable("t3-pi-adapter-steer-images-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const threadId = ThreadId.make("thread-pi-steer-images");
+    const nativeEntries: Array<unknown> = [];
+    const nativeEventLogger = {
+      filePath: "memory://pi-native-events",
+      write: (entry) => Effect.sync(() => nativeEntries.push(entry)),
+      close: () => Effect.void,
+    } satisfies EventNdjsonLogger;
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        const attachment = {
+          type: "image" as const,
+          id: "thread-pi-steer-images-00000000-0000-4000-8000-000000000001",
+          name: "redirect.webp",
+          mimeType: "image/webp",
+          sizeBytes: 2,
+        };
+        NodeFS.writeFileSync(
+          NodePath.join(attachmentsDir, attachmentRelativePath(attachment)),
+          Uint8Array.from([16, 17]),
+        );
+
+        const adapter = yield* makePiAdapter(settings, {
+          instanceId: INSTANCE_ID,
+          environment: {
+            ...process.env,
+            PI_FAKE_CAPTURE_IMAGES: "1",
+            PI_FAKE_WAIT_FOR_ABORT: "1",
+            PI_FAKE_SETTLE_ON_STEER: "1",
+          },
+          nativeEventLogger,
+        });
+        yield* adapter.startSession(startInput(threadId));
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.takeUntil(
+            (event) => event.type === "turn.completed" || event.type === "turn.aborted",
+          ),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true }),
+        );
+
+        const firstTurn = yield* adapter.sendTurn({ threadId, input: "Start working" });
+        const steeredTurn = yield* adapter.sendTurn({
+          threadId,
+          input: "Use this image instead",
+          attachments: [attachment],
+        });
+        const runtimeEvents = Array.from(yield* Fiber.join(eventsFiber));
+
+        const steer = nativeEntries
+          .map((entry) => Option.getOrUndefined(decodeNativeEventLogEntry(entry)))
+          .flatMap((entry) => (entry ? [entry.event.payload] : []))
+          .find((payload) => payload.type === "test_steer_received");
+        expect(steer).toMatchObject({
+          type: "test_steer_received",
+          message: "Use this image instead",
+        });
+        expect(steer?.images).toEqual([{ type: "image", data: "EBE=", mimeType: "image/webp" }]);
+        expect(encodeUnknownJson(runtimeEvents)).not.toContain("EBE=");
+        expect(steeredTurn.turnId).toBe(firstTurn.turnId);
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
+
+  it.effect("reports missing image data and native prompt rejection as typed failures", () => {
+    const fake = makeFakePiExecutable("t3-pi-adapter-image-errors-");
+    const settings = decodePiSettings({ enabled: true, binaryPath: fake.executable });
+    const missingThreadId = ThreadId.make("thread-pi-missing-image");
+    const rejectedThreadId = ThreadId.make("thread-pi-rejected-image");
+    const missingAttachment = {
+      type: "image" as const,
+      id: "thread-pi-missing-image-00000000-0000-4000-8000-000000000001",
+      name: "missing.png",
+      mimeType: "image/png",
+      sizeBytes: 4,
+    };
+    const existingAttachment = {
+      type: "image" as const,
+      id: "thread-pi-rejected-image-00000000-0000-4000-8000-000000000001",
+      name: "existing.png",
+      mimeType: "image/png",
+      sizeBytes: 4,
+    };
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const { attachmentsDir } = yield* ServerConfig.ServerConfig;
+        NodeFS.writeFileSync(
+          NodePath.join(attachmentsDir, attachmentRelativePath(existingAttachment)),
+          Uint8Array.from([0, 1, 2, 3]),
+        );
+
+        const adapter = yield* makePiAdapter(settings, { instanceId: INSTANCE_ID });
+        yield* adapter.startSession(startInput(missingThreadId));
+        const missing = yield* adapter
+          .sendTurn({ threadId: missingThreadId, attachments: [missingAttachment] })
+          .pipe(Effect.flip);
+        expect(missing).toMatchObject({
+          _tag: "ProviderAdapterRequestError",
+          method: "prompt",
+          detail: expect.stringContaining("Failed to read image attachment"),
+        });
+
+        const rejectingAdapter = yield* makePiAdapter(settings, {
+          instanceId: ProviderInstanceId.make("pi_reject_image"),
+          environment: { ...process.env, PI_FAKE_REJECT_FIRST_PROMPT: "1" },
+        });
+        yield* rejectingAdapter.startSession({
+          ...startInput(rejectedThreadId),
+          providerInstanceId: ProviderInstanceId.make("pi_reject_image"),
+        });
+        const rejection = yield* rejectingAdapter
+          .sendTurn({
+            threadId: rejectedThreadId,
+            input: "Inspect this",
+            attachments: [existingAttachment],
+          })
+          .pipe(Effect.flip);
+        expect(rejection).toMatchObject({
+          _tag: "ProviderAdapterRequestError",
+          method: "prompt",
+        });
+        expect(rejection.message).toContain("rejected first fake prompt");
+      }),
+    ).pipe(
+      Effect.provide(testLayer()),
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(fake.directory, { recursive: true }))),
+    );
+  });
 
   it.effect("keeps stop, stop-all, and sibling process ownership isolated and idempotent", () => {
     const fake = makeFakePiExecutable("t3-pi-adapter-");
