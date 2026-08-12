@@ -61,30 +61,13 @@ T3 Code looks for, but authenticate with `agent login`, not `cursor-agent login`
 Run the login command on the machine running the T3 Code server, not on the device you browse
 from.
 
-Pi Agent requires version 0.84.1 or newer. T3 Code uses Pi's existing models, credentials,
-settings, project-trust decisions, and native session storage; configure those in Pi itself. The
-model picker shows Pi's native provider/model identities and supported thinking levels, and can
-switch models within an existing thread. Pi-backed threads resume their exact native conversation
-after a server restart or idle cleanup. Sending another message while a Pi turn is active steers
-that turn, and stopping it interrupts the native Pi turn without ending the session. Image
-attachments are sent to multimodal Pi models in both new messages and steering messages.
-Interactive Pi extensions surface their select, confirm, input, and editor dialogs through T3
-Code's structured input prompts, and their warning and error notifications appear in the thread.
-The slash-command picker shows Pi's native commands — extension commands, prompt templates,
-and skills — with Pi's own descriptions, where skills keep their `skill:` prefix and insert as
-`/skill:name`. Selecting a command inserts the raw slash prompt and Pi performs its own
-expansion, so commands behave exactly as they do inside Pi; commands that only exist in Pi's
-interactive terminal are not listed.
-Pi can also generate thread titles and source-control text (commit messages, branch names, and
-pull-request content) in isolated, tool-disabled sessions that never touch the active chat
-conversation. Pi does not expose T3 Code's permission or plan-mode controls.
-
-When Pi reports a newer version, T3 Code shows the advisory in provider settings. For a recognized
-package-managed installation, **Update now** runs Pi's native `pi update --self` command (or the
-matching global package-manager update when the install maps to one). Only Pi itself is touched;
-extensions, packages, credentials, settings, and model catalogs remain under Pi's control. If the
-executable uses a custom installation path that T3 Code cannot classify, use Pi's own updater
-manually from that installation.
+Pi Agent requires version 0.84.1 or newer, installed and authenticated separately; Pi stays the
+source of truth for its own models, credentials, settings, project-trust decisions, and native
+session storage. T3 Code shows Pi's model picker and slash-command picker, steers and interrupts
+native turns, resumes the exact native conversation, sends image attachments, and surfaces Pi
+extension dialogs and version advisories. Pi does not expose T3 Code's permission or plan-mode
+controls, and T3 Code does not bundle the Pi SDK or CLI. See
+[Pi Agent](./providers-pi.md) for the full setup and capability guide.
 
 ### Binary Discovery
 
@@ -100,7 +83,8 @@ T3 Code. You can install T3 Code, open it, and add providers afterwards. A provi
 authenticated shows its status in **Settings** and fails at session start with the login command
 to run.
 
-For multi-account setups, see [Codex](./providers-codex.md) and [Claude](./providers-claude.md).
+For multi-account setups, see [Codex](./providers-codex.md), [Claude](./providers-claude.md),
+and [Pi Agent](./providers-pi.md).
 
 ## Next Steps
 

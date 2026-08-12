@@ -1,12 +1,20 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
+import { fromYaml } from "@t3tools/shared/schemaYaml";
+import desktopPackageJson from "../apps/desktop/package.json" with { type: "json" };
 
 import {
   BuildCommandFailedError,
@@ -766,4 +774,73 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.equal(resolved.mockUpdates, false);
     }),
   );
+
+  it("never depends on the Pi SDK or bundles Pi artifacts", () => {
+    const piArtifactPattern = /(?:pi-coding-agent|@earendil-works)/i;
+    const testRoot = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
+
+    // No Pi SDK (or any Pi package) may appear in the desktop manifest,
+    // whether as a production dependency or a dev-only one.
+    for (const section of ["dependencies", "devDependencies"] as const) {
+      for (const name of Object.keys(desktopPackageJson[section] ?? {})) {
+        assert.ok(!piArtifactPattern.test(name), `${section} references ${name}`);
+      }
+    }
+
+    // The resolved runtime dependency set (what a packaged desktop installs)
+    // must stay Pi-free too.
+    const workspaceYaml = NodeFS.readFileSync(
+      NodePath.join(testRoot, "../pnpm-workspace.yaml"),
+      "utf8",
+    );
+    const catalog = Schema.decodeSync(
+      fromYaml(Schema.Struct({ catalog: Schema.Record(Schema.String, Schema.String) })),
+    )(workspaceYaml).catalog;
+    for (const name of Object.keys(
+      resolveDesktopRuntimeDependencies(desktopPackageJson.dependencies, catalog),
+    )) {
+      assert.ok(!piArtifactPattern.test(name), `runtime dependency ${name}`);
+    }
+
+    // None of the packaging globs may reference Pi files.
+    for (const exclusion of DESKTOP_FILE_EXCLUSIONS) {
+      assert.ok(!piArtifactPattern.test(exclusion), `file exclusion ${exclusion}`);
+    }
+    for (const unpack of WINDOWS_ASAR_UNPACK) {
+      assert.ok(!piArtifactPattern.test(unpack), `asar unpack glob ${unpack}`);
+    }
+    for (const resource of DESKTOP_EXTRA_RESOURCES) {
+      assert.ok(!piArtifactPattern.test(resource.from), `extra resource ${resource.from}`);
+      assert.ok(!piArtifactPattern.test(resource.to), `extra resource target ${resource.to}`);
+    }
+
+    // When a build output already exists on disk, scan it for bundled Pi
+    // artifacts (files, or a shipped pi/pi.cmd/pi.exe executable).
+    const bundledRoots = [
+      NodePath.join(testRoot, "../apps/desktop/dist-electron"),
+      NodePath.join(testRoot, "../apps/server/dist"),
+    ];
+    for (const root of bundledRoots) {
+      if (!NodeFS.existsSync(root)) continue;
+      const piFiles: string[] = [];
+      const walk = (dir: string) => {
+        for (const entry of NodeFS.readdirSync(dir, { withFileTypes: true })) {
+          const full = NodePath.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(full);
+          } else if (entry.isFile()) {
+            const relative = NodePath.relative(root, full);
+            if (
+              piArtifactPattern.test(relative) ||
+              /(?:^|[\\/])pi(?:[.-][\w-]+)?(?:\.(?:cmd|exe|ps1|bat))?$/i.test(entry.name)
+            ) {
+              piFiles.push(relative);
+            }
+          }
+        }
+      };
+      walk(root);
+      assert.deepStrictEqual(piFiles, [], `bundled Pi artifacts under ${root}`);
+    }
+  });
 });

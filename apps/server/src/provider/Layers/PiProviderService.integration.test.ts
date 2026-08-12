@@ -9,7 +9,6 @@ import {
   type ProviderInstanceConfigMap,
   ThreadId,
 } from "@t3tools/contracts";
-import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -21,7 +20,6 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 import { describe, expect } from "vite-plus/test";
 
-import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -38,8 +36,8 @@ import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import { makeFakePiExecutable } from "../testUtils/piFakeExecutable.ts";
+import { BackgroundPolicyAlwaysRunLayer } from "../testUtils/piTestLayers.ts";
 
-const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 const PiNativeLogEntry = Schema.Struct({
   event: Schema.Struct({
     payload: Schema.StructWithRest(Schema.Struct({ type: Schema.String }), [
@@ -48,35 +46,6 @@ const PiNativeLogEntry = Schema.Struct({
   }),
 });
 const decodePiNativeLogEntry = Schema.decodeUnknownOption(PiNativeLogEntry);
-
-const BackgroundPolicyAlwaysRunLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-  reportClientActivity: () => Effect.void,
-  removeRpcClient: () => Effect.void,
-  reportHostPowerState: () => Effect.void,
-  snapshot: Effect.succeed({
-    hostPower: {
-      source: "unknown",
-      idle: "unknown",
-      idleSeconds: null,
-      locked: "unknown",
-      suspended: false,
-      onBattery: "unknown",
-      lowPowerMode: "unknown",
-      thermalState: "unknown",
-      stale: true,
-      updatedAt: TEST_EPOCH,
-    },
-    leases: [],
-    activeForegroundLeaseCount: 0,
-    activeScopeKeys: [],
-    shouldRunOpportunisticWork: true,
-    updatedAt: TEST_EPOCH,
-  }),
-  streamChanges: Stream.empty,
-  hasDemand: () => Effect.succeed(true),
-  shouldRunScopeWork: () => Effect.succeed(true),
-  shouldRunOpportunisticWork: Effect.succeed(true),
-});
 
 function makeTestLayer(
   executable: string,
@@ -248,8 +217,17 @@ describe("Pi provider through ProviderService", () => {
       prefix: "pi-text-only-test-",
     }).pipe(
       Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(FetchHttpClient.layer),
       Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
       Layer.provideMerge(settingsLayer),
+      Layer.provideMerge(
+        Layer.succeed(
+          ProviderVersionCache,
+          new Map([
+            [PI_NPM_PACKAGE_NAME, { expiresAt: Number.MAX_SAFE_INTEGER, version: "0.84.1" }],
+          ]),
+        ),
+      ),
       Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
     );
     const textGenerationLayer = TextGeneration.layer.pipe(
